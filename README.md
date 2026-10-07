@@ -4,6 +4,13 @@
 
 > 网盘下载链接：[百度网盘](https://pan.baidu.com/s/1pp-zCAjt-A_haEtox9vs3Q?pwd=r2um)，提取码：`r2um`。
 
+上下文：262,144
+实测 decode：65.1 tok/s
+prefill：500.1 tok/s
+TTFT：2.3 秒
+MTP 接受率：87.1%
+1000-token 输出连续正确
+
 ## 适用范围
 
 - 已在 Windows、RTX 4060 Laptop 8GB（`sm_89`）、32GB 系统内存上验证。RTX 40 系其他 Ada 卡可按显存情况尝试；RTX 30/50 系需要各自架构的引擎，不能使用这里的 `ninfer-serve-89.exe`。
