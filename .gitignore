@@ -1,0 +1,10 @@
+# Publish only the reviewed files in this repository.
+*
+!.gitignore
+!README.md
+!NOTICE.md
+!LICENSE
+!assets.sha256
+!start-local.bat
+!verify-assets.ps1
+!smoke-test.ps1
