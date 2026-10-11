@@ -5,6 +5,14 @@
 !NOTICE.md
 !LICENSE
 !assets.sha256
+!assets-20261012.sha256
 !start-local.bat
 !verify-assets.ps1
 !smoke-test.ps1
+!CHANGELOG.md
+!integration/
+!integration/**
+!tests/
+!tests/test_interactive_agent.py
+!engine-patches/
+!engine-patches/**

@@ -1,12 +1,12 @@
 [CmdletBinding()]
-param([string]$AssetsDir)
+param([string]$AssetsDir, [string]$ManifestPath)
 
 $ErrorActionPreference = 'Stop'
 if (-not $AssetsDir) {
     $AssetsDir = Join-Path $PSScriptRoot '..\bonsai2-27b-ptq1-vision-8gb-assets'
 }
 $root = [IO.Path]::GetFullPath($AssetsDir)
-$manifest = Join-Path $PSScriptRoot 'assets.sha256'
+$manifest = if ($ManifestPath) { [IO.Path]::GetFullPath($ManifestPath) } else { Join-Path $PSScriptRoot 'assets.sha256' }
 $count = 0
 $failed = 0
 
@@ -25,7 +25,14 @@ foreach ($line in Get-Content -LiteralPath $manifest) {
         $failed++
         continue
     }
-    $actual = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToUpperInvariant()
+    $stream = [IO.File]::OpenRead($file)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $actual = [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-', '')
+    } finally {
+        $stream.Dispose()
+        $hasher.Dispose()
+    }
     if ($actual -ne $expected) {
         Write-Host "MISMATCH $relative"
         $failed++

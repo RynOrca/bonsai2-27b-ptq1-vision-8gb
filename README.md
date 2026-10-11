@@ -4,6 +4,7 @@
 
 > 网盘下载链接：[百度网盘](https://pan.baidu.com/s/1pp-zCAjt-A_haEtox9vs3Q?pwd=r2um)，提取码：`r2um`。
 
+以下为旧版短任务记录，不是长输出续轮指标：
 上下文：262,144
 实测 decode：65.1 tok/s
 prefill：500.1 tok/s
@@ -11,10 +12,31 @@ TTFT：2.3 秒
 MTP 接受率：87.1%
 1000-token 输出连续正确
 
+## 2026-10-12 修复更新
+
+修复文件已准备，网盘增量包待上传，模型不变。为避免现有下载者校验失败，默认`assets.sha256`暂时保留旧版；新引擎使用[assets-20261012.sha256](assets-20261012.sha256)，不能混用清单。以下默认下载表格仍对应旧网盘版本。
+
+收到2026-10-12增量包并覆盖资产目录后，使用：
+
+```powershell
+.\verify-assets.ps1 -ManifestPath .\assets-20261012.sha256
+```
+
+新引擎为1,510,906,368字节，SHA256 `4702480551D4E2C84B5982BDE3B7A8FCC45F7BC59A932CB38A74A8026D15D526`。启动脚本路径和模型文件名不变。
+
+- 修复动态KV lease约4K提前截断、长前缀Host-backed复用时的物理页准备与尾页复制问题，保留跨请求复用。
+- 自建Agent须原样回传assistant的`reasoning_content`和正文，并保持模板/工具schema稳定。默认不设置固定思考预算。接入示例见[integration/AGENT_ADAPTATION.md](integration/AGENT_ADAPTATION.md)。
+- 已安装发布版：首轮真实生成16384 token后，续轮输入51551、命中51527、实算24、TTFT0.82秒；续轮生成15371 token后自然停止。同一实例，未重启。另一份只增加诊断的构建验证了连续两轮满额16384，不能将两份二进制混为一份。
+- 相对丢弃思考历史的对照，第二轮TTFT从66.02秒降至约0.82秒。此为样本结果，不是所有任务、全部上下文或质量保证。
+- 修正开发构建依赖前缀的编码问题；正常下载运行无需安装编译工具。源码修复与可选诊断补丁见[engine-patches/README.md](engine-patches/README.md)。
+
+详见[CHANGELOG.md](CHANGELOG.md)。本次未重新验收视觉路径、多并发、Host近满及长期压力。
+
 ## 适用范围
 
 - 已在 Windows、RTX 4060 Laptop 8GB（`sm_89`）、32GB 系统内存上验证。RTX 40 系其他 Ada 卡可按显存情况尝试；RTX 30/50 系需要各自架构的引擎，不能使用这里的 `ninfer-serve-89.exe`。
 - NVIDIA 驱动需支持随包的 CUDA 13 运行库。测试机驱动为 610.62；无须另外安装 CUDA Toolkit。
+- 新运行库依赖Windows上的Visual C++2022 x64运行库；缺少MSVCP140/VCRUNTIME140时应安装微软官方x64 Redistributable。
 - 显卡同时承担桌面显示，启动后通常只剩约 0.1–0.3GB 显存。请关闭动态壁纸、游戏等占显存程序。
 - 视觉权重是第三方拼接的非官方制品。来源和分发提醒见 [NOTICE.md](NOTICE.md)。
 
@@ -96,7 +118,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\verify-assets.ps1
 
 ## 已知限制
 
-- 作者将“深度超出 GPU KV 池 + 大输出预留”登记为未完全修复的 B01 缺陷。测试机曾在约 56K token、含 4 张图片和 8K 输出上限的续写中触发分页 KV 不变量错误。两个恢复开关可减少整个服务陷入持续 503 的风险，但不能保证该请求成功。遇到 500/503 时，先检查 `/health`；长会话可缩短单次输出预算并保存工作后开启新会话。
+- 本次修复通过了已复现的文本长输出截断和Host-restore用例；旧版约56K、4张图片、8K输出预算的混合场景尚未复测，不能认定所有B01边界消失。出错时保存工作并检查`/health`，不要无限自动重试。
 - 高强度思考在部分提示上可能反复输出同一段推理；日常 Agent 用 `medium` 或关闭思考更稳。
 - `overlay` 在 8GB 卡上的显存余量很小。启动失败时先释放显存；不能通过减小设备池就断言长上下文质量不变。
 - 图片请求中把 `image_url` 放在文本之前，`detail` 用 `auto`。图片被静默忽略时应检查提示 token 数和输出是否真的引用图片细节。

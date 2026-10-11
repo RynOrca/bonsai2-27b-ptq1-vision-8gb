@@ -1,0 +1,68 @@
+diff --git a/src/runtime/engine/context_cache/resource_manager.h b/src/runtime/engine/context_cache/resource_manager.h
+index d95e8ad..99618cc 100644
+--- a/src/runtime/engine/context_cache/resource_manager.h
++++ b/src/runtime/engine/context_cache/resource_manager.h
+@@ -374,21 +374,17 @@ public:
+                 const std::optional<PrefixShortlistKey> incoming =
+                     base.prefix_shortlist_key(index.key.frontier);
+                 if (!incoming) {
+-                    if (index.shared) {
+-                        cdbg_log("[candgen] priv SKIP slot=%u NULLOPT idx_frontier=%u shared=1 "
+-                                 "sl_size=%zu\n",
+-                                 index.slot, index.key.frontier, base.prefix_shortlist_size());
+-                    } else {
+-                        const CatalogEntry& stored = catalog_[index.slot];
+-                        const bool own = stored.session && base.context_cache().session_key &&
+-                                         *stored.session == *base.context_cache().session_key;
+-                        cdbg_log("[candgen] priv SKIP slot=%u NULLOPT idx_frontier=%u shared=0 "
+-                                 "sl_size=%zu sess=%016llx %s\n",
+-                                 index.slot, index.key.frontier, base.prefix_shortlist_size(),
+-                                 stored.session ? session_fingerprint(stored.session->view())
+-                                                : 0ULL,
+-                                 own ? "OWN" : "XSESSION");
+-                    }
++                    // A stored checkpoint whose frontier lies beyond the incoming prompt cannot be
++                    // adopted at all: the engine matches exact-at-a-frontier and never looks for a
++                    // shorter common prefix, so this candidate dies before Program verification.
++                    // Report it explicitly, otherwise the run looks like a plain cache miss when
++                    // the incoming history was simply re-serialized shorter than the generation.
++                    cdbg_log("[candgen] priv SKIP slot=%u FRONTIER-BEYOND-PROMPT kind=%u "
++                             "frontier=%u prompt_tokens=%u sl_size=%zu shared=%d\n",
++                             index.slot,
++                             static_cast<unsigned>(index.checkpoint.kind),
++                             index.key.frontier, base.summary().prompt_tokens,
++                             base.prefix_shortlist_size(), index.shared ? 1 : 0);
+                     continue;
+                 }
+                 if (incoming->identity_tag != index.key.identity_tag) {
+@@ -398,18 +394,20 @@ public:
+                     continue;
+                 }
+                 if (*incoming != index.key) {
+-                    // Own-session guard: a re-touch probes every stored slot, so a
+-                    // *different* session's response naturally mismatches a slot it does
+-                    // not own. Label those XSESSION-MISMATCH so they are not mistaken for a
+-                    // real key-match failure of the re-touch's own checkpoint.
++                    // Only a request that actually carries a session key can be judged to belong
++                    // to another session. Without one, every stored entry would look foreign, so
++                    // report the honest reason: the frontier digest chain disagrees. That is what
++                    // happens when the same visible history re-serializes into different tokens
++                    // (a template-option change, or a tool set altered mid-session).
+                     const CatalogEntry& probe_entry = catalog_[index.slot];
+-                    const bool own_session =
++                    const bool foreign_session =
+                         probe_entry.session && base.context_cache().session_key &&
+-                        *probe_entry.session == *base.context_cache().session_key;
+-                    cdbg_log("[candgen] priv SKIP slot=%u %s frontier=%u "
+-                             "in=(%llx,%llx) st=(%llx,%llx)\n",
+-                             index.slot, own_session ? "DIGEST-MISMATCH" : "XSESSION-MISMATCH",
+-                             index.key.frontier,
++                        *probe_entry.session != *base.context_cache().session_key;
++                    cdbg_log("[candgen] priv SKIP slot=%u %s kind=%u frontier=%u "
++                             "base_tag=%u idx_tag=%u in=(%llx,%llx) st=(%llx,%llx)\n",
++                             index.slot, foreign_session ? "XSESSION-MISMATCH" : "DIGEST-MISMATCH",
++                             static_cast<unsigned>(index.checkpoint.kind), index.key.frontier,
++                             incoming->identity_tag, index.key.identity_tag,
+                              static_cast<unsigned long long>(incoming->digests[0]),
+                              static_cast<unsigned long long>(incoming->digests[1]),
+                              static_cast<unsigned long long>(index.key.digests[0]),

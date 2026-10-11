@@ -1,0 +1,1736 @@
+diff --git a/src/models/qwen3_5/program/planning/pressure.cpp b/src/models/qwen3_5/program/planning/pressure.cpp
+index 2d80a6b..5229fd9 100644
+--- a/src/models/qwen3_5/program/planning/pressure.cpp
++++ b/src/models/qwen3_5/program/planning/pressure.cpp
+@@ -439,6 +439,23 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_admission(
+         identity_status == runtime::PreflightStatus::Ready
+             ? runtime::MaterializationPhysicalStatus::Feasible
+             : runtime::MaterializationPhysicalStatus::Infeasible;
++    // TEMPORARY DIAGNOSTIC (2026-10-11): why the reuse-after-long-decode plan is refused.
++    if (plan->impl_->has_source) {
++        std::fprintf(stderr,
++                     "[diag] admission verdict: reuse_base=%u status=%d fork=%d mode=%d "
++                     "reusable=%u transfers=%zu pool_usable=%u pool_alloc=%u\n",
++                     plan->impl_->reuse_base, static_cast<int>(identity_status),
++                     plan->impl_->text_prefix_fork_required ? 1 : 0,
++                     static_cast<int>(plan->impl_->source_mode),
++                     plan->impl_->summary.reusable_prompt_tokens,
++                     plan->impl_->transfer_requirements.size(),
++                     text_kv_pages != nullptr
++                         ? text_kv_pages->physical_pool().usable_pages()
++                         : 0U,
++                     text_kv_pages != nullptr
++                         ? text_kv_pages->physical_pool().allocated_pages()
++                         : 0U);
++    }
+     plan->impl_->identity_assessment.source_mode = plan->impl_->source_mode;
+     plan->impl_->identity_assessment.pressure_may_change_machine_work =
+         plan->impl_->has_source &&
+@@ -545,6 +562,8 @@ ProgramImpl::materialization_source_protection(const ResourceCandidateState& adm
+     if (kv == nullptr) { return protection; }
+ 
+     protection.text       = kv->text;
++    protection.text_prefix_fork_deferred = admission.text_prefix_fork_deferred;
++    protection.backend_prefix_fork_deferred = admission.backend_prefix_fork_deferred;
+     protection.text_pages = kv_pages_for_frontier(admission.reuse_base);
+     if (protection.consumed_private_source) {
+         protection.text_transfer_pages =
+@@ -1822,11 +1841,14 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
+                 }
+                 detail::PhysicalResources active_added;
+                 detail::PhysicalResources transferred;
++                const bool deferred = resource == runtime::ContextResourceClass::MainKV
++                    ? protection->text_prefix_fork_deferred
++                    : protection->backend_prefix_fork_deferred;
+                 if (resource == runtime::ContextResourceClass::MainKV) {
+-                    active_added.device.main_kv_pages = 1;
++                    active_added.device.main_kv_pages = !deferred || device_resident ? 1U : 0U;
+                     if (device_resident) { transferred.device.main_kv_pages = 1; }
+                 } else {
+-                    active_added.device.backend_kv_pages = 1;
++                    active_added.device.backend_kv_pages = !deferred || device_resident ? 1U : 0U;
+                     if (device_resident) { transferred.device.backend_kv_pages = 1; }
+                 }
+                 if (host_resident) {
+@@ -2355,6 +2377,8 @@ bool ProgramImpl::compose_pressure_candidate(
+                 return false;
+             }
+         }
++        details.text_prefix_fork_deferred &= details.text_prefix_fork_required;
++        details.backend_prefix_fork_deferred &= details.backend_prefix_fork_required;
+     }
+ 
+     std::vector<HostKVAllocationRequest> host_requests;
+@@ -2425,6 +2449,20 @@ ProgramImpl::revalidate_materialization(const AdmissionCandidate& plan,
+     }
+ 
+     const AdmissionCandidateImpl& details = *plan.impl_;
++    const auto valid_deferred_fork = [&](bool deferred, bool fork,
++                                         const LogicalKVPageStore* pages,
++                                         std::uint32_t frontier) {
++        return !deferred || (fork && pages != nullptr && reuse_hostbacked_enabled() &&
++                            ring_requested() && kv_pages_for_frontier(frontier) >
++                                pages->physical_pool().usable_pages());
++    };
++    if (!valid_deferred_fork(details.text_prefix_fork_deferred,
++                             details.text_prefix_fork_required, text_kv_pages.get(), details.reuse_base) ||
++        !valid_deferred_fork(details.backend_prefix_fork_deferred,
++                             details.backend_prefix_fork_required, backend_kv_pages.get(),
++                             backend_frontier_at(speculative_backend, details.reuse_base))) {
++        return runtime::PreflightStatus::InvariantFailure;
++    }
+     if (details.blocked_host_allocation_bytes != 0) {
+         return runtime::PreflightStatus::StalePolicyState;
+     }
+diff --git a/src/models/qwen3_5/program/planning/request_plan.cpp b/src/models/qwen3_5/program/planning/request_plan.cpp
+index 5fe2a8a..b9a3e5b 100644
+--- a/src/models/qwen3_5/program/planning/request_plan.cpp
++++ b/src/models/qwen3_5/program/planning/request_plan.cpp
+@@ -871,6 +871,26 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+         }
+         return out;
+     };
++    const auto missing_tail_restore = [&](const KVAddressSpaceStore& addresses,
++                                          const LogicalKVPageStore& pages,
++                                          KVAddressSpaceHandle address, std::uint32_t frontier) {
++        if (frontier == 0 || frontier % kPagedKVPageSize == 0) { return 0U; }
++        const auto tail = addresses.logical_page(address, kv_pages_for_frontier(frontier) - 1U);
++        if (pages.device_resident(tail)) { return 0U; }
++        if (!pages.host_resident(tail) || !pages.host_replica_current(tail)) {
++            throw std::logic_error("fork tail has no current restorable replica");
++        }
++        return 1U;
++    };
++    const auto resident_full_pages = [&](const KVAddressSpaceStore& addresses,
++                                         const LogicalKVPageStore& pages,
++                                         KVAddressSpaceHandle address, std::uint32_t frontier) {
++        std::uint32_t resident = 0;
++        for (std::uint32_t page = 0; page < frontier / kPagedKVPageSize; ++page) {
++            if (pages.device_resident(addresses.logical_page(address, page))) { ++resident; }
++        }
++        return resident;
++    };
+     const detail::PhysicalResources source_resources =
+         source != nullptr ? owner_exclusive_resources(*source) : detail::PhysicalResources{};
+     plan->source_resources = source_resources;
+@@ -930,6 +950,12 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+                 partial_tail_cow_required(*backend_kv_addresses, *source_kv->backend,
+                                           backend_frontier);
+         }
++        plan->text_prefix_fork_deferred =
++            plan->text_prefix_fork_required && reuse_hostbacked_enabled() && ring_requested() &&
++            kv_pages_for_frontier(plan->reuse_base) > text_kv_pages->physical_pool().usable_pages();
++        plan->backend_prefix_fork_deferred =
++            plan->backend_prefix_fork_required && reuse_hostbacked_enabled() && ring_requested() &&
++            kv_pages_for_frontier(backend_frontier) > backend_kv_pages->physical_pool().usable_pages();
+         const std::uint32_t main_required = kv_pages_for_tokens(plan->reuse_base);
+         const std::uint32_t main_device =
+             device_kv_prefix_pages(*text_kv_addresses, source_kv->text, plan->reuse_base);
+@@ -941,11 +967,14 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+         if (main_missing != main_required - main_device) {
+             throw std::logic_error("Text KV restore inventory is inconsistent");
+         }
+-        plan->needs_transfer = plan->needs_transfer || main_missing != 0;
+-        if (main_missing != 0) {
++        const std::uint32_t main_restore = plan->text_prefix_fork_deferred
++            ? missing_tail_restore(*text_kv_addresses, *text_kv_pages, source_kv->text, plan->reuse_base)
++            : main_missing;
++        plan->needs_transfer = plan->needs_transfer || main_restore != 0;
++        if (main_restore != 0) {
+             add_kv_transfer(runtime::ContextResourceClass::MainKV,
+                             runtime::ContextTransferDirection::HostToDevice, *text_kv_pages,
+-                            main_missing, main_contiguous_runs);
++                            main_restore, plan->text_prefix_fork_deferred ? 1U : main_contiguous_runs);
+         }
+         if (source_kv->backend && backend_frontier != 0) {
+             const std::uint32_t backend_required = kv_pages_for_tokens(backend_frontier);
+@@ -959,11 +988,14 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+             if (backend_missing != backend_required - backend_device) {
+                 throw std::logic_error("Backend KV restore inventory is inconsistent");
+             }
+-            plan->needs_transfer = plan->needs_transfer || backend_missing != 0;
+-            if (backend_missing != 0) {
++            const std::uint32_t backend_restore = plan->backend_prefix_fork_deferred
++                ? missing_tail_restore(*backend_kv_addresses, *backend_kv_pages, *source_kv->backend, backend_frontier)
++                : backend_missing;
++            plan->needs_transfer = plan->needs_transfer || backend_restore != 0;
++            if (backend_restore != 0) {
+                 add_kv_transfer(runtime::ContextResourceClass::BackendKV,
+                                 runtime::ContextTransferDirection::HostToDevice, *backend_kv_pages,
+-                                backend_missing, backend_contiguous_runs);
++                                backend_restore, plan->backend_prefix_fork_deferred ? 1U : backend_contiguous_runs);
+             }
+         }
+         if (plan->text_prefix_fork_required) {
+@@ -997,11 +1029,15 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+             throw std::logic_error("retained source has no KV address space");
+         }
+         const std::uint32_t main_full_pages =
+-            plan->reuse_base / static_cast<std::uint32_t>(kPagedKVPageSize);
++            plan->text_prefix_fork_deferred
++                ? resident_full_pages(*text_kv_addresses, *text_kv_pages, source_kv->text, plan->reuse_base)
++                : plan->reuse_base / static_cast<std::uint32_t>(kPagedKVPageSize);
+         const std::uint32_t backend_frontier =
+             backend_frontier_at(speculative_backend, plan->reuse_base);
+         const std::uint32_t backend_full_pages =
+-            backend_frontier / static_cast<std::uint32_t>(kPagedKVPageSize);
++            plan->backend_prefix_fork_deferred
++                ? resident_full_pages(*backend_kv_addresses, *backend_kv_pages, *source_kv->backend, backend_frontier)
++                : backend_frontier / static_cast<std::uint32_t>(kPagedKVPageSize);
+         if (main_full_pages > active.main_kv_pages ||
+             backend_full_pages > active.backend_kv_pages) {
+             throw std::logic_error("retained prefix exceeds its active KV entitlement");
+@@ -1022,7 +1058,9 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+         if (main_device > main_required) {
+             throw std::logic_error("retained Text KV replica count exceeds requirement");
+         }
+-        source_replica_additions.device.main_kv_pages = main_required - main_device;
++        source_replica_additions.device.main_kv_pages = plan->text_prefix_fork_deferred
++            ? missing_tail_restore(*text_kv_addresses, *text_kv_pages, source_kv->text, plan->reuse_base)
++            : main_required - main_device;
+         if (source_kv->backend) {
+             const std::uint32_t backend_required =
+                 backend_frontier == 0 ? 0U : kv_pages_for_tokens(backend_frontier);
+@@ -1031,7 +1069,9 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+             if (backend_device > backend_required) {
+                 throw std::logic_error("retained Backend KV replica count exceeds requirement");
+             }
+-            source_replica_additions.device.backend_kv_pages = backend_required - backend_device;
++            source_replica_additions.device.backend_kv_pages = plan->backend_prefix_fork_deferred
++                ? missing_tail_restore(*backend_kv_addresses, *backend_kv_pages, *source_kv->backend, backend_frontier)
++                : backend_required - backend_device;
+         }
+         detail::PhysicalResources retained_tail_added;
+         detail::PhysicalResources retained_tail_removed;
+@@ -1080,7 +1120,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+                 }
+                 return true;
+             };
+-        if (!plan_retained_tail_release(
++        if (!plan->text_prefix_fork_deferred && !plan_retained_tail_release(
+                 *text_kv_addresses, *text_kv_pages, source_kv->text, plan->reuse_base,
+                 active_resources.device.main_kv_pages,
+                 source_replica_additions.device.main_kv_pages, plan->text_prefix_fork_required,
+@@ -1088,7 +1128,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+             return std::nullopt;
+         }
+         if (source_kv->backend) {
+-            if (!plan_retained_tail_release(
++            if (!plan->backend_prefix_fork_deferred && !plan_retained_tail_release(
+                     *backend_kv_addresses, *backend_kv_pages, *source_kv->backend, backend_frontier,
+                     active_resources.device.backend_kv_pages,
+                     source_replica_additions.device.backend_kv_pages,
+@@ -1162,7 +1202,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+     std::size_t transient_host_bytes            = 0;
+     const auto private_tail_restore =
+         [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
+-            KVAddressSpaceHandle address, std::uint32_t frontier, bool prefix_fork) {
++            KVAddressSpaceHandle address, std::uint32_t frontier, bool prefix_fork,
++            bool deferred) {
+             std::pair<std::uint32_t, std::size_t> out;
+             if (!prefix_fork || frontier == 0 ||
+                 frontier % static_cast<std::uint32_t>(kPagedKVPageSize) == 0) {
+@@ -1173,12 +1214,16 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+                 throw std::logic_error("checkpoint KV requirement exceeds address membership");
+             }
+             const LogicalKVPageHandle tail = addresses.logical_page(address, required - 1U);
+-            if (pages.address_references(tail) != 1 || pages.device_resident(tail)) { return out; }
++            if (pages.device_resident(tail) || (!deferred && pages.address_references(tail) != 1)) {
++                return out;
++            }
+             if (!pages.host_resident(tail)) {
+                 throw std::logic_error("private COW tail has no restorable replica");
+             }
+             out.first  = 1;
+-            out.second = plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
++            if (pages.address_references(tail) == 1) {
++                out.second = plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
++            }
+             return out;
+         };
+     if (source != nullptr) {
+@@ -1198,9 +1243,11 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+ 
+         if (!source->kv) { throw std::logic_error("private checkpoint has no KV address space"); }
+         const std::uint32_t main_shared =
+-            shared_kv_prefix_pages(*text_kv_addresses, source->kv->text, plan->reuse_base);
+-        const std::uint32_t main_missing_shared = missing_shared_device_kv_prefix_pages(
+-            *text_kv_addresses, source->kv->text, plan->reuse_base);
++            plan->text_prefix_fork_deferred
++                ? shared_device_kv_prefix_pages(*text_kv_addresses, source->kv->text, plan->reuse_base)
++                : shared_kv_prefix_pages(*text_kv_addresses, source->kv->text, plan->reuse_base);
++        const std::uint32_t main_missing_shared = plan->text_prefix_fork_deferred ? 0U
++            : missing_shared_device_kv_prefix_pages(*text_kv_addresses, source->kv->text, plan->reuse_base);
+         if (main_shared > exclusive_active.main_kv_pages) {
+             throw std::logic_error("shared Main KV exceeds the active entitlement");
+         }
+@@ -1216,12 +1263,15 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+                 backend_frontier_at(speculative_backend, plan->reuse_base);
+             const std::uint32_t backend_shared = shared_kv_prefix_pages(
+                 *backend_kv_addresses, *source->kv->backend, backend_frontier);
+-            const std::uint32_t backend_missing_shared = missing_shared_device_kv_prefix_pages(
+-                *backend_kv_addresses, *source->kv->backend, backend_frontier);
+-            if (backend_shared > exclusive_active.backend_kv_pages) {
++            const std::uint32_t backend_shared_credit = plan->backend_prefix_fork_deferred
++                ? shared_device_kv_prefix_pages(*backend_kv_addresses, *source->kv->backend, backend_frontier)
++                : backend_shared;
++            const std::uint32_t backend_missing_shared = plan->backend_prefix_fork_deferred ? 0U
++                : missing_shared_device_kv_prefix_pages(*backend_kv_addresses, *source->kv->backend, backend_frontier);
++            if (backend_shared_credit > exclusive_active.backend_kv_pages) {
+                 throw std::logic_error("shared Backend KV exceeds the active entitlement");
+             }
+-            exclusive_active.backend_kv_pages -= backend_shared;
++            exclusive_active.backend_kv_pages -= backend_shared_credit;
+             shared_replica_additions.device.backend_kv_pages = backend_missing_shared;
+             const std::uint32_t backend_shared_device        = shared_device_kv_prefix_pages(
+                 *backend_kv_addresses, *source->kv->backend, backend_frontier);
+@@ -1234,7 +1284,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+             host_kv_prefix_bytes(*text_kv_addresses, source->kv->text, plan->reuse_base);
+         const auto [main_tail_restore, main_discarded_host_bytes] =
+             private_tail_restore(*text_kv_addresses, *text_kv_pages, source->kv->text,
+-                                 plan->reuse_base, plan->text_prefix_fork_required);
++                                 plan->reuse_base, plan->text_prefix_fork_required,
++                                 plan->text_prefix_fork_deferred);
+         transient_source_restores.device.main_kv_pages = main_tail_restore;
+         transient_host_bytes                           = main_discarded_host_bytes;
+         if (source->kv->backend) {
+@@ -1248,7 +1299,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+             retained_host.kv_bytes += backend_bytes;
+             const auto [backend_tail_restore, backend_discarded_host_bytes] =
+                 private_tail_restore(*backend_kv_addresses, *backend_kv_pages, *source->kv->backend,
+-                                     backend_frontier, plan->backend_prefix_fork_required);
++                                     backend_frontier, plan->backend_prefix_fork_required,
++                                     plan->backend_prefix_fork_deferred);
+             transient_source_restores.device.backend_kv_pages = backend_tail_restore;
+             if (backend_discarded_host_bytes >
+                 std::numeric_limits<std::size_t>::max() - transient_host_bytes) {
+diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
+index 2d4fda1..a89e84a 100644
+--- a/src/models/qwen3_5/program/program_impl.h
++++ b/src/models/qwen3_5/program/program_impl.h
+@@ -252,6 +252,8 @@ struct ResourceCandidateState {
+     bool state_fork_required          = false;
+     bool text_prefix_fork_required    = false;
+     bool backend_prefix_fork_required = false;
++    bool text_prefix_fork_deferred    = false;
++    bool backend_prefix_fork_deferred = false;
+     bool needs_transfer               = false;
+     std::vector<qwen3_5::detail::PressureDecision> pressure_options;
+     std::vector<runtime::PlanningOwnerId> pressure_owner_ids;
+@@ -948,10 +950,12 @@ private:
+         std::uint32_t text_pages          = 0;
+         std::uint32_t text_transfer_pages = 0;
+         bool text_prefix_fork_required    = false;
++        bool text_prefix_fork_deferred    = false;
+         std::optional<KVAddressSpaceHandle> backend;
+         std::uint32_t backend_pages          = 0;
+         std::uint32_t backend_transfer_pages = 0;
+         bool backend_prefix_fork_required    = false;
++        bool backend_prefix_fork_deferred    = false;
+     };
+ 
+     struct PendingTransaction {
+diff --git a/src/models/qwen3_5/program/storage/context.cpp b/src/models/qwen3_5/program/storage/context.cpp
+index a6ea68d..1f0495a 100644
+--- a/src/models/qwen3_5/program/storage/context.cpp
++++ b/src/models/qwen3_5/program/storage/context.cpp
+@@ -2174,17 +2174,24 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
+     const auto target = [reach](std::uint32_t cap, std::uint32_t pages, std::uint32_t wanted) {
+         return std::min(cap, std::max(pages, std::min(reach, wanted)));
+     };
++    const auto lease_capacity = [&](const KVAddressSpaceStore& addresses,
++                                    const LogicalKVPageStore& pages) {
++        // A ring lease promises logical coverage backed by Host storage; its physical working
++        // set is bounded separately. Clipping that promise to the Device pool makes a long
++        // prompt's first output window impossible to extend, even with ample Host capacity.
++        return ring_requested() ? addresses.page_capacity()
++                                : std::min(pages.physical_pool().capacity_pages(),
++                                           addresses.page_capacity());
++    };
+     const auto targets = [&](std::uint32_t extra_tokens) {
+         return DeviceKVPages{
+-            .main = target(std::min(text_kv_pages->physical_pool().capacity_pages(),
+-                                    text_kv_addresses->page_capacity()),
++            .main = target(lease_capacity(*text_kv_addresses, *text_kv_pages),
+                            text_pages,
+                            kv_lease_pages_for_tokens(
+                                std::min(request.lease_ceiling, main_tokens + extra_tokens))),
+             .backend =
+                 sequence.kv->backend
+-                    ? target(std::min(backend_kv_pages->physical_pool().capacity_pages(),
+-                                      backend_kv_addresses->page_capacity()),
++                    ? target(lease_capacity(*backend_kv_addresses, *backend_kv_pages),
+                              backend_pages,
+                              backend_thin ? kv_lease_pages_for_tokens(std::min(
+                                                 backend_ceiling, backend_tokens + extra_tokens))
+@@ -2200,8 +2207,18 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
+         resize_sequence_kv_entitlement(sequence, wanted.main, wanted.backend);
+         // The extended lease is this owner's resource effect: keep the accounting the population
+         // proofs read in step with it.
+-        request.active_resources.device.main_kv_pages += wanted.main - text_pages;
+-        request.active_resources.device.backend_kv_pages += wanted.backend - backend_pages;
++        const auto physical_growth = [&](std::uint32_t before, std::uint32_t after,
++                                         const LogicalKVPageStore& pages) {
++            if (!ring_requested()) { return after - before; }
++            const auto cap = pages.physical_pool().usable_pages();
++            return std::min(after, cap) - std::min(before, cap);
++        };
++        request.active_resources.device.main_kv_pages +=
++            physical_growth(text_pages, wanted.main, *text_kv_pages);
++        if (sequence.kv->backend) {
++            request.active_resources.device.backend_kv_pages +=
++                physical_growth(backend_pages, wanted.backend, *backend_kv_pages);
++        }
+         return true;
+     };
+     const std::uint32_t page = static_cast<std::uint32_t>(kPagedKVPageSize);
+diff --git a/src/models/qwen3_5/program/storage/kv_store.h b/src/models/qwen3_5/program/storage/kv_store.h
+index 5923029..730eeb0 100644
+--- a/src/models/qwen3_5/program/storage/kv_store.h
++++ b/src/models/qwen3_5/program/storage/kv_store.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "core/paged_kv_cache.h"
++#include "ninfer/types.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -152,9 +153,10 @@ public:
+           full_pages_(other.full_pages_), tail_columns_(other.tail_columns_),
+           requested_entitlement_(other.requested_entitlement_),
+           page_reservation_(std::move(other.page_reservation_)), row_(std::move(other.row_)),
+-          tail_destination_(other.tail_destination_),
+-          staged_tail_release_(other.staged_tail_release_),
+-          tail_source_settled_(other.tail_source_settled_) {
++          tail_destination_(other.tail_destination_),
++          staged_tail_release_(other.staged_tail_release_),
++          tail_source_settled_(other.tail_source_settled_),
++          defer_missing_replicas_(other.defer_missing_replicas_) {
+         other.tail_destination_.reset();
+     }
+ 
+@@ -171,12 +173,13 @@ private:
+                             std::uint32_t requested_entitlement,
+                             DeviceKVPageReservation&& page_reservation, KVExecutionRowLease&& row,
+                             std::optional<LogicalKVPageHandle> tail_destination,
+-                            bool staged_tail_release) noexcept
++                            bool staged_tail_release, bool defer_missing_replicas) noexcept
+         : owner_(&owner), source_(source), destination_(destination), frontier_(frontier),
+           full_pages_(full_pages), tail_columns_(tail_columns),
+           requested_entitlement_(requested_entitlement),
+           page_reservation_(std::move(page_reservation)), row_(std::move(row)),
+-          tail_destination_(tail_destination), staged_tail_release_(staged_tail_release) {}
++          tail_destination_(tail_destination), staged_tail_release_(staged_tail_release),
++          defer_missing_replicas_(defer_missing_replicas) {}
+ 
+     KVAddressSpaceStore* owner_ = nullptr;
+     KVAddressSpaceHandle source_;
+@@ -189,7 +192,8 @@ private:
+     std::optional<KVExecutionRowLease> row_;
+     std::optional<LogicalKVPageHandle> tail_destination_;
+     bool staged_tail_release_ = false;
+-    bool tail_source_settled_ = false;
++    bool tail_source_settled_ = false;
++    bool defer_missing_replicas_ = false;
+ 
+     friend class KVAddressSpaceStore;
+ };
+@@ -508,13 +512,24 @@ public:
+         return require(handle).source_pins;
+     }
+ 
+-    [[nodiscard]] bool can_pin_source(LogicalKVPageHandle handle) const noexcept {
++    [[nodiscard]] bool can_pin_source(LogicalKVPageHandle handle) const noexcept {
+         if (!valid(handle)) { return false; }
+         const Page& page = pages_[handle.index_];
+         return page.device_replica.has_value() && page.writer_references == 0 &&
+                !page.destination_pinned &&
+                page.source_pins != std::numeric_limits<std::uint32_t>::max();
+-    }
++    }
++
++    // A fork shares logical identity, not a physical page ID. Immutable Host-only pages can
++    // therefore remain on Host while pinned, until the active retrieval window needs them.
++    [[nodiscard]] bool can_pin_retained_source(LogicalKVPageHandle handle) const noexcept {
++        if (!valid(handle)) { return false; }
++        const Page& page = pages_[handle.index_];
++        return (page.device_replica || host_replica_current(handle)) &&
++               !page.pending_device_replica && page.writer_references == 0 &&
++               !page.destination_pinned &&
++               page.source_pins != std::numeric_limits<std::uint32_t>::max();
++    }
+ 
+     [[nodiscard]] bool can_pin_active_source(LogicalKVPageHandle handle) const noexcept {
+         if (!valid(handle)) { return false; }
+@@ -1150,9 +1165,10 @@ public:
+     }
+ 
+     [[nodiscard]] KVPrefixForkReservation
+-    prepare_prefix_fork(KVAddressSpaceHandle source_handle, KVAddressSpaceHandle destination_handle,
+-                        std::uint32_t frontier, std::uint32_t entitlement,
+-                        std::int32_t execution_row, bool staged_tail_release = false) {
++    prepare_prefix_fork(KVAddressSpaceHandle source_handle, KVAddressSpaceHandle destination_handle,
++                        std::uint32_t frontier, std::uint32_t entitlement,
++                        std::int32_t execution_row, bool staged_tail_release = false,
++                        bool defer_missing_replicas = false) {
+         Address& source      = require(source_handle);
+         Address& destination = require(destination_handle);
+         if (source.active || source.row || source.reservation.valid()) {
+@@ -1175,19 +1191,37 @@ public:
+         if (staged_tail_release && tail_columns == 0) {
+             throw std::invalid_argument("staged KV prefix fork has no partial tail");
+         }
+-        for (std::uint32_t page = 0; page < required_pages; ++page) {
+-            const LogicalKVPageHandle logical = membership(source, page);
+-            const std::uint32_t required      = page < full_pages ? page_size : tail_columns;
+-            if (!pages_->device_resident(logical) ||
+-                pages_->committed_columns(logical) < required || !pages_->can_pin_source(logical) ||
+-                (page < full_pages && !pages_->can_retain_reference(logical, false))) {
+-                throw std::logic_error("KV retained-prefix source is not stable");
+-            }
+-        }
++        std::uint32_t deferred_missing = 0;
++        for (std::uint32_t page = 0; page < required_pages; ++page) {
++            const LogicalKVPageHandle logical = membership(source, page);
++            const std::uint32_t required      = page < full_pages ? page_size : tail_columns;
++            const bool may_defer = defer_missing_replicas && page < full_pages;
++            if (pages_->committed_columns(logical) < required) {
++                throw std::logic_error("KV retained-prefix source has insufficient committed coverage");
++            }
++            if (pages_->source_pins(logical) == std::numeric_limits<std::uint32_t>::max()) {
++                throw std::overflow_error("KV retained-prefix source pin count overflow");
++            }
++            // A missing Device replica is capacity only when the logical source is otherwise
++            // valid and its Host content can be restored. Broken coverage, epoch, writer,
++            // pending-copy or reference invariants must not become request-local capacity errors.
++            if (pages_->address_references(logical) == 0 ||
++                !pages_->can_pin_retained_source(logical) ||
++                (page < full_pages && !pages_->can_retain_reference(logical, false))) {
++                throw std::logic_error("KV retained-prefix source has an invalid stable replica or reference");
++            }
++            if (!pages_->device_resident(logical) && !may_defer) {
++                throw ninfer::ContextCacheExhausted(
++                    std::string("KV retained-prefix source cannot be shared: page ") +
++                    std::to_string(page) + " of " + std::to_string(required_pages) +
++                    " needs its valid Host replica restored to Device");
++            }
++            if (!pages_->device_resident(logical)) { ++deferred_missing; }
++        }
+ 
+         DeviceKVPageReservation reservation = pages_->physical_pool().make_empty_reservation();
+         pages_->physical_pool().resize_reservation(
+-            reservation, staged_tail_release ? 1U : entitlement - full_pages);
++            reservation, staged_tail_release ? 1U : entitlement - full_pages + deferred_missing);
+         KVExecutionRowLease row = tables_->acquire(execution_row);
+         std::optional<LogicalKVPageHandle> tail_destination;
+         if (tail_columns != 0) {
+@@ -1199,7 +1233,7 @@ public:
+         return KVPrefixForkReservation(*this, source_handle, destination_handle, frontier,
+                                        full_pages, tail_columns, entitlement,
+                                        std::move(reservation), std::move(row), tail_destination,
+-                                       staged_tail_release);
++                                       staged_tail_release, defer_missing_replicas);
+     }
+ 
+     [[nodiscard]] DeviceKVPageHandle
+@@ -1254,50 +1288,79 @@ public:
+         const Address& source             = require(fork.source_);
+         const LogicalKVPageHandle logical = membership(source, fork.full_pages_);
+         if (!pages_->valid(logical) || pages_->device_resident(logical) ||
+-            !pages_->host_resident(logical)) {
++            !pages_->host_replica_current(logical)) {
+             throw std::logic_error("KV prefix-fork retained tail was not moved to Host");
+         }
+         const std::uint32_t required_pages = pages_for_tokens(fork.frontier_);
+         const std::uint32_t growth         = fork.requested_entitlement_ - required_pages;
+-        pages_->physical_pool().resize_reservation(fork.page_reservation_, growth);
++        pages_->physical_pool().resize_reservation(
++            fork.page_reservation_, growth + prefix_fork_deferred_missing(fork));
+     }
+ 
+     void commit_prefix_fork(KVPrefixForkReservation&& fork, RankStreams stream = {}) {
+         require_prefix_fork(fork);
+         Address& source                    = require(fork.source_);
+         Address& destination               = require(fork.destination_);
+-        const std::uint32_t required_pages = pages_for_tokens(fork.frontier_);
+-        const std::uint32_t growth         = fork.requested_entitlement_ - required_pages;
+-        if (!fork.row_ || destination.active || destination.row ||
+-            destination.reservation.valid() || destination.page_count != 0 ||
+-            fork.page_reservation_.pages() != growth) {
+-            throw std::logic_error("KV prefix-fork destination changed before publication");
++        const std::uint32_t required_pages = pages_for_tokens(fork.frontier_);
++        const std::uint32_t growth         = fork.requested_entitlement_ - required_pages;
++        const std::uint32_t deferred_missing = prefix_fork_deferred_missing(fork);
++        if (!fork.row_ || destination.active || destination.row ||
++            destination.reservation.valid() || destination.page_count != 0 ||
++            fork.page_reservation_.pages() != growth + deferred_missing) {
++            throw std::logic_error(
++                "KV prefix-fork destination changed before publication: frontier=" +
++                std::to_string(fork.frontier_) + " requested_entitlement=" +
++                std::to_string(fork.requested_entitlement_) + " growth=" +
++                std::to_string(growth) + " deferred_missing=" + std::to_string(deferred_missing) +
++                " actual_reservation=" + std::to_string(fork.page_reservation_.pages()) +
++                " staged=" + std::to_string(fork.staged_tail_release_) +
++                " tail_settled=" + std::to_string(fork.tail_source_settled_) +
++                " fork_row=" + std::to_string(fork.row_.has_value()) +
++                " destination_active=" + std::to_string(destination.active) +
++                " destination_row=" + std::to_string(destination.row.has_value()) +
++                " destination_reservation=" + std::to_string(destination.reservation.valid()) +
++                " destination_page_count=" + std::to_string(destination.page_count));
+         }
+         for (std::uint32_t page = 0; page < required_pages; ++page) {
+-            const LogicalKVPageHandle logical = membership(source, page);
+-            const bool settled_tail = page == fork.full_pages_ && fork.tail_source_settled_;
+-            if ((!settled_tail &&
+-                 (pages_->source_pins(logical) == 0 || !pages_->device_resident(logical))) ||
+-                (settled_tail && (!fork.staged_tail_release_ || pages_->device_resident(logical) ||
+-                                  !pages_->host_resident(logical))) ||
++            const LogicalKVPageHandle logical = membership(source, page);
++            const bool settled_tail = page == fork.full_pages_ && fork.tail_source_settled_;
++            const bool replica_available = pages_->device_resident(logical) ||
++                (fork.defer_missing_replicas_ && page < fork.full_pages_ &&
++                 pages_->host_replica_current(logical));
++            const std::uint32_t required_columns =
++                page < fork.full_pages_ ? static_cast<std::uint32_t>(kPagedKVPageSize)
++                                        : fork.tail_columns_;
++            if ((!settled_tail &&
++                 (pages_->source_pins(logical) == 0 || !replica_available)) ||
++                (settled_tail && (!fork.staged_tail_release_ || pages_->device_resident(logical) ||
++                                  !pages_->host_replica_current(logical))) ||
++                pages_->committed_columns(logical) < required_columns ||
++                pages_->writer_references(logical) != 0 ||
+                 (page < fork.full_pages_ && !pages_->can_retain_reference(logical, false))) {
+                 throw std::logic_error("KV prefix-fork source changed before publication");
+             }
+         }
+-        if (fork.tail_columns_ != 0 &&
+-            (!fork.tail_destination_ || !pages_->valid(*fork.tail_destination_))) {
+-            throw std::logic_error("KV prefix-fork tail destination is stale");
+-        }
+-
+-        publish_scratch_.clear();
+-        for (std::uint32_t page = 0; page < fork.full_pages_; ++page) {
+-            publish_scratch_.push_back(pages_->physical(membership(source, page)));
+-        }
+-        if (fork.tail_destination_) {
+-            publish_scratch_.push_back(pages_->physical(*fork.tail_destination_));
+-        }
+-        tables_->publish(fork.row_->handle(), 0, publish_scratch_, stream);
+-
++        if (fork.tail_columns_ != 0 &&
++            (!fork.tail_destination_ || !pages_->valid(*fork.tail_destination_))) {
++            throw std::logic_error("KV prefix-fork tail destination is stale");
++        }
++
++        // Publish only resident runs, before changing membership ownership. Host-only slots
++        // remain masked by the ring until restore_page_from_host publishes their Device IDs.
++        for (std::uint32_t page = 0; page < required_pages;) {
++            const auto logical_at = [&](std::uint32_t index) {
++                return index < fork.full_pages_ ? membership(source, index)
++                                                : *fork.tail_destination_;
++            };
++            if (!pages_->device_resident(logical_at(page))) { ++page; continue; }
++            const std::uint32_t begin = page;
++            publish_scratch_.clear();
++            while (page < required_pages && pages_->device_resident(logical_at(page))) {
++                publish_scratch_.push_back(pages_->physical(logical_at(page++)));
++            }
++            tables_->publish(fork.row_->handle(), begin, publish_scratch_, stream);
++        }
++
+         for (std::uint32_t page = 0; page < fork.full_pages_; ++page) {
+             const LogicalKVPageHandle logical = membership(source, page);
+             pages_->retain_reference(logical, false);
+@@ -1314,10 +1377,11 @@ public:
+         destination.reservation        = std::move(fork.page_reservation_);
+         destination.row.emplace(std::move(*fork.row_));
+         fork.row_.reset();
+-        destination.active = true;
+-        for (std::uint32_t page = 0; page < required_pages; ++page) {
+-            pages_->retain_active_reference(membership(destination, page));
+-        }
++        destination.active = true;
++        for (std::uint32_t page = 0; page < required_pages; ++page) {
++            const auto logical = membership(destination, page);
++            if (pages_->device_resident(logical)) { pages_->retain_active_reference(logical); }
++        }
+         for (std::uint32_t page = 0; page < required_pages; ++page) {
+             if (page == fork.full_pages_ && fork.tail_source_settled_) { continue; }
+             pages_->unpin_source(membership(source, page));
+@@ -1338,11 +1402,13 @@ public:
+                 }
+             }
+         }
+-        if (fork.tail_destination_) {
++        if (fork.tail_destination_) {
+             pages_->abort_transfer_destination(*fork.tail_destination_, fork.page_reservation_);
+             fork.tail_destination_.reset();
+-        }
+-        fork.owner_ = nullptr;
++        }
++        fork.row_.reset();
++        fork.page_reservation_.release();
++        fork.owner_ = nullptr;
+     }
+ 
+     [[nodiscard]] KVPagePrefixForkReservation prepare_page_prefix_fork(
+@@ -2054,8 +2120,19 @@ public:
+         return true;
+     }
+ 
+-private:
+-    struct Address {
++private:
++    [[nodiscard]] std::uint32_t
++    prefix_fork_deferred_missing(const KVPrefixForkReservation& fork) const {
++        if (!fork.defer_missing_replicas_) { return 0; }
++        const Address& source = require(fork.source_);
++        std::uint32_t missing = 0;
++        for (std::uint32_t page = 0; page < fork.full_pages_; ++page) {
++            if (!pages_->device_resident(membership(source, page))) { ++missing; }
++        }
++        return missing;
++    }
++
++    struct Address {
+         std::uint32_t generation          = 1;
+         std::uint32_t page_count          = 0;
+         std::uint32_t committed_frontier  = 0;
+diff --git a/src/models/qwen3_5/program/transactions/materialization.cpp b/src/models/qwen3_5/program/transactions/materialization.cpp
+index 6d781e1..acf7c26 100644
+--- a/src/models/qwen3_5/program/transactions/materialization.cpp
++++ b/src/models/qwen3_5/program/transactions/materialization.cpp
+@@ -829,13 +829,11 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
+         for (std::uint32_t page = 0; page < required; ++page) {
+             if (!pages.device_resident(addresses.logical_page(address, page))) { ++missing; }
+         }
+-        const auto& pool         = pages.physical_pool();
+-        const std::uint32_t room = pool.usable_pages() > pool.allocated_pages()
+-                                       ? pool.usable_pages() - pool.allocated_pages()
+-                                       : 0U;
++        std::uint32_t room = 0;
++        for (const KVPageRun& run : pages.physical_pool().free_runs()) { room += run.count; }
+         return missing > room;
+     };
+-    bool defer_text_replicas = false;
++    bool defer_text_replicas = details.text_prefix_fork_deferred;
+     if (text_prefix_fork) {
+         transaction.text_source_restore_reservation.emplace(
+             text_kv_pages->physical_pool().make_empty_reservation());
+@@ -849,7 +847,7 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
+             activation_address, details.text_kv_page_entitlement, static_cast<std::int32_t>(lane),
+             transaction.text_activation_frontier, defer_text_replicas));
+     }
+-    bool defer_backend_replicas = false;
++    bool defer_backend_replicas = details.backend_prefix_fork_deferred;
+     if (backend_address && backend_prefix_fork) {
+         transaction.backend_source_restore_reservation.emplace(
+             backend_kv_pages->physical_pool().make_empty_reservation());
+@@ -877,42 +875,76 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
+             if (mapped > addresses.mapped_pages(address)) {
+                 throw std::logic_error("KV activation frontier exceeds address membership");
+             }
++            const bool sparse_fork = source_reservation && defer;
++            const bool partial_tail = activation_frontier &&
++                *activation_frontier % static_cast<std::uint32_t>(kPagedKVPageSize) != 0;
++            // A Host-aware fork shares immutable full pages. Only its partial tail must be
++            // present for the private copy; restoring the whole prefix defeats the ring.
++            const std::uint32_t begin = sparse_fork ? mapped - (partial_tail ? 1U : 0U) : 0U;
+             std::uint32_t missing = 0;
+-            for (std::uint32_t page = 0; page < mapped; ++page) {
++            for (std::uint32_t page = begin; page < mapped; ++page) {
+                 if (!pages.device_resident(addresses.logical_page(address, page))) { ++missing; }
+             }
+-            // LOCAL FIX (ring restore room): restoring a checkpoint's Host pages needs
+-            // Device room, but nothing demoted first, so a pool already holding other
+-            // residents failed the single-page materialization. Drain the inactive
+-            // addresses (pure cache) before restoring this one.
+-            if (missing != 0) {
+-                (void)demote_other_addresses_to_host(addresses, pages, address, missing);
++            const auto physical_free_pages = [&pages]() {
++                std::uint32_t free = 0;
++                for (const KVPageRun& run : pages.physical_pool().free_runs()) { free += run.count; }
++                return free;
++            };
++            const std::uint32_t hard_room = missing + (sparse_fork && partial_tail ? 1U : 0U);
++            if (physical_free_pages() < hard_room) {
++                // Protect logical identities, not only the selected address. Another cached
++                // address can alias a required Device page, including a complete stored page
++                // whose first few columns form the selected COW tail.
++                std::vector<LogicalKVPageHandle> pinned;
++                try {
++                    pinned.reserve(mapped - begin);
++                    for (std::uint32_t page = begin; page < mapped; ++page) {
++                        const auto logical = addresses.logical_page(address, page);
++                        if (!pages.device_resident(logical)) { continue; }
++                        if (!pages.can_pin_source(logical)) {
++                            throw std::logic_error("KV restore has an unstable required Device page");
++                        }
++                        pages.pin_source(logical);
++                        pinned.push_back(logical);
++                    }
++                    (void)demote_other_addresses_to_host(addresses, pages, address,
++                                                         hard_room - physical_free_pages());
++                    // Demotion publishes Host replicas and returns Device slots after queuing
++                    // compute-stream copies. Even a failed publication can have queued a copy;
++                    // fence before a transfer stream reads those bytes or reuses those slots.
++                    device.synchronize();
++                    if (sparse_fork && physical_free_pages() < hard_room) {
++                        (void)demote_kv_pages_to_host(
++                            addresses, pages, address, 0U, hard_room - physical_free_pages(), {});
++                        device.synchronize();
++                    }
++                } catch (...) {
++                    try { device.synchronize(); } catch (...) {}
++                    for (const auto logical : pinned) { pages.unpin_source(logical); }
++                    throw;
++                }
++                for (const auto logical : pinned) { pages.unpin_source(logical); }
+             }
+             if (source_reservation) {
+                 pages.physical_pool().resize_reservation(reservation, missing);
+             }
+-            // ROUTE 3 (lazy adopt): materialize only what the Device can hold right now, NEWEST pages
+-            // first -- the ring's window is the recent tail and its mask covers exactly the resident
+-            // set. Every page left behind keeps its reservation page as this lane's on-demand budget,
+-            // and the ring restores it a page at a time (restore_kv_pages_from_host,
+-            // storage\context.cpp:2183) when the retrieval window asks for it. Without the gate this
+-            // is the historic "restore the whole activation range, ascending" walk, unchanged.
+-            std::uint32_t restore_budget = missing;
+-            if (defer) {
+-                const auto& pool           = pages.physical_pool();
+-                const std::uint32_t room   = pool.usable_pages() > pool.allocated_pages()
+-                                                 ? pool.usable_pages() - pool.allocated_pages()
+-                                                 : 0U;
+-                constexpr std::uint32_t kDeferredSlack = 4U;  // room for the ring's own restore churn
+-                restore_budget = std::min<std::uint32_t>(
+-                    missing, room > kDeferredSlack ? room - kDeferredSlack : room);
++            const bool optional_restores = defer && !source_reservation;
++            if (!optional_restores && physical_free_pages() < hard_room) {
++                throw ninfer::ContextCacheExhausted("KV restore has no physical room for its required pages");
+             }
+-            std::uint32_t restored = 0;
+-            for (std::uint32_t index = 0; index < mapped; ++index) {
+-                const std::uint32_t page = defer ? mapped - 1U - index : index;
++            const auto room = physical_free_pages();
++            constexpr std::uint32_t slack = 4U;
++            const std::uint32_t restore_budget = optional_restores
++                ? std::min(missing, room > slack ? room - slack : room) : missing;
++            std::uint32_t restored       = 0;
++            for (std::uint32_t index = 0; index < mapped - begin; ++index) {
++                if (restored >= restore_budget || reservation.pages() == 0 ||
++                    physical_free_pages() == 0) {
++                    break;
++                }
++                const std::uint32_t page = defer ? mapped - 1U - index : begin + index;
+                 const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+                 if (pages.device_resident(logical)) { continue; }
+-                if (defer && restored >= restore_budget) { continue; }
+                 if (!pages.host_resident(logical) || !host_kv_extents) {
+                     throw std::logic_error("checkpoint KV page has no restorable replica");
+                 }
+@@ -1029,7 +1061,7 @@ void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction)
+             source_kv->text, *transaction.root_text_address, *transaction.text_activation_frontier,
+             details.text_kv_page_entitlement,
+             static_cast<std::int32_t>(transaction.destination.value),
+-            details.text_retained_tail_release));
++            details.text_retained_tail_release, details.text_prefix_fork_deferred));
+         prepare_retained_tail_backup(
+             *text_kv_addresses, *text_kv_pages, *transaction.text_prefix_fork,
+             details.text_retained_tail_release, transaction.text_retained_tail,
+@@ -1061,7 +1093,7 @@ void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction)
+             *source_kv->backend, *transaction.root_backend_address,
+             *transaction.backend_activation_frontier, details.backend_kv_page_entitlement,
+             static_cast<std::int32_t>(transaction.destination.value),
+-            details.backend_retained_tail_release));
++            details.backend_retained_tail_release, details.backend_prefix_fork_deferred));
+         prepare_retained_tail_backup(
+             *backend_kv_addresses, *backend_kv_pages, *transaction.backend_prefix_fork,
+             details.backend_retained_tail_release, transaction.backend_retained_tail,
+diff --git a/cmake/FindFFMPEG.cmake b/cmake/FindFFMPEG.cmake
+index d53824a..5c943c3 100644
+--- a/cmake/FindFFMPEG.cmake
++++ b/cmake/FindFFMPEG.cmake
+@@ -1,76 +1,108 @@
+-# FindFFMPEG.cmake — bridge for NInfer's `find_package(FFMPEG)` on native Windows.
+-#
+-# The ffmpeg vcpkg port (unlike curl) installs no CMake package config. On Windows
+-# NInfer consumes a prebuilt vcpkg triplet tree (VCPKG_ROOT + VCPKG_TARGET_TRIPLET
+-# environment variables, exported by build_native.bat) that provides av* import
+-# libs + headers + DLLs. This module assembles the standard FFMPEG_* variables from
+-# that tree so the top-level CMakeLists.txt (which consumes FFMPEG_INCLUDE_DIRS /
+-# FFMPEG_LIBRARY_DIRS / FFMPEG_LIBRARIES) works unmodified, and creates imported
+-# FFMPEG_<lib> targets whose runtime DLL dependencies are staged next to the
+-# linking executable.
+-#
+-# Also sets FFMPEG_VCPKG_TREE (the resolved triplet root) for callers.
+-
+-include(FindPackageHandleStandardArgs)
+-
+-if(NOT DEFINED ENV{VCPKG_ROOT} OR NOT DEFINED ENV{VCPKG_TARGET_TRIPLET})
+-  set(_ffmpeg_reason "VCPKG_ROOT and VCPKG_TARGET_TRIPLET environment variables are not set (build_native.bat exports both)")
+-  find_package_handle_standard_args(FFMPEG
+-    REQUIRED_VARS FFMPEG_INCLUDE_DIRS FFMPEG_LIBRARY_DIRS FFMPEG_LIBRARIES
+-    FAIL_MESSAGE "${_ffmpeg_reason}")
+-  return()
+-endif()
+-
+-set(FFMPEG_VCPKG_TREE "$ENV{VCPKG_ROOT}/installed/$ENV{VCPKG_TARGET_TRIPLET}")
+-
+-set(_ffmpeg_needed avformat avcodec avutil swscale)
+-set(_ffmpeg_libs_found TRUE)
+-foreach(_lib IN LISTS _ffmpeg_needed)
+-  if(NOT EXISTS "${FFMPEG_VCPKG_TREE}/lib/${_lib}.lib")
+-    set(_ffmpeg_libs_found FALSE)
+-    set(_ffmpeg_reason "missing ${_lib}.lib in ${FFMPEG_VCPKG_TREE}/lib (the vcpkg tree lacks ffmpeg)")
+-  endif()
+-endforeach()
+-
+-if(EXISTS "${FFMPEG_VCPKG_TREE}/include/libavformat/avformat.h")
+-  set(_ffmpeg_include "${FFMPEG_VCPKG_TREE}/include")
+-else()
+-  set(_ffmpeg_include "")
+-endif()
+-
+-if(NOT _ffmpeg_include OR NOT _ffmpeg_libs_found)
+-  if(NOT _ffmpeg_reason)
+-    set(_ffmpeg_reason "ffmpeg headers not found in the vcpkg tree")
+-  endif()
+-  find_package_handle_standard_args(FFMPEG
+-    REQUIRED_VARS FFMPEG_INCLUDE_DIRS FFMPEG_LIBRARY_DIRS FFMPEG_LIBRARIES
+-    FAIL_MESSAGE "${_ffmpeg_reason}")
+-  return()
+-endif()
+-
+-set(FFMPEG_INCLUDE_DIRS "${_ffmpeg_include}")
+-set(FFMPEG_LIBRARY_DIRS "${FFMPEG_VCPKG_TREE}/lib")
+-set(FFMPEG_LIBRARIES "")
+-foreach(_lib IN LISTS _ffmpeg_needed)
+-  add_library(FFMPEG_${_lib} STATIC IMPORTED)
+-  set_target_properties(FFMPEG_${_lib} PROPERTIES
+-    IMPORTED_LOCATION "${FFMPEG_VCPKG_TREE}/lib/${_lib}.lib")
+-  list(APPEND FFMPEG_LIBRARIES FFMPEG_${_lib})
+-endforeach()
+-
+-# Stage the shared-library artifacts (import libs reference these DLLs) next to
+-# any executable that links the FFMPEG targets. CMake de-duplicates the copies.
+-file(GLOB _ffmpeg_dlls "${FFMPEG_VCPKG_TREE}/bin/*.dll")
+-foreach(_lib IN LISTS _ffmpeg_needed)
+-  if(_ffmpeg_dlls)
+-    set_target_properties(FFMPEG_${_lib} PROPERTIES
+-      IMPORTED_LINK_DEPENDENT_LIBRARIES "${_ffmpeg_dlls}")
+-  endif()
+-endforeach()
+-
+-add_library(FFMPEG::FFMPEG INTERFACE IMPORTED)
+-target_include_directories(FFMPEG::FFMPEG INTERFACE "${_ffmpeg_include}")
+-target_link_libraries(FFMPEG::FFMPEG INTERFACE ${FFMPEG_LIBRARIES})
+-
+-find_package_handle_standard_args(FFMPEG
+-  REQUIRED_VARS FFMPEG_INCLUDE_DIRS FFMPEG_LIBRARY_DIRS FFMPEG_LIBRARIES)
+\ No newline at end of file
++# FindFFMPEG.cmake — locate an unpacked FFmpeg SDK for NInfer on native Windows.
++#
++# WHY THIS REPLACES THE vcpkg BRIDGE: the tracked module of the same name resolves
++# FFmpeg only through a vcpkg triplet tree and hard-codes the pre-8.x artifact
++# names (`lib/swscale.lib`). FFmpeg 8.x ships versioned names on Windows
++# (`swscale-9.lib`, `avcodec-62.dll`, ...), so that module reports
++# "missing swscale.lib in .../lib" even when a complete SDK is present. This host
++# has no vcpkg; it has the SDK unpacked at C:\ffmpeg.
++#
++# It sets exactly what cmake/Dependencies.cmake consumes:
++#   FFMPEG_INCLUDE_DIRS, FFMPEG_LIBRARY_DIRS, FFMPEG_LIBRARIES, FFMPEG_VCPKG_TREE
++# Point FFMPEG_DIR, FFMPEG_ROOT or CMAKE_PREFIX_PATH at the SDK root (the directory
++# holding include/libavcodec/avcodec.h and lib/).
++#
++# The ABI floors mirror the Linux branch of Dependencies.cmake, because
++# src/media/decode/decode.cpp is written against them:
++#   libavformat >= 60, libavcodec >= 60, libavutil >= 58, libswscale >= 7
++
++include(FindPackageHandleStandardArgs)
++
++set(_ffmpeg_hints "")
++foreach(_hint IN ITEMS "${FFMPEG_DIR}" "${FFMPEG_ROOT}" "${FFMPEG_VCPKG_TREE}"
++                        "$ENV{FFMPEG_DIR}" "$ENV{FFMPEG_ROOT}")
++  if(_hint)
++    list(APPEND _ffmpeg_hints "${_hint}")
++  endif()
++endforeach()
++
++find_path(FFMPEG_INCLUDE_DIR
++  NAMES libavcodec/avcodec.h
++  HINTS ${_ffmpeg_hints}
++  PATH_SUFFIXES include)
++
++# FFmpeg 8.x versions its Windows import libraries, so match the base name and let
++# CMake pick whichever variant the SDK ships.
++foreach(_lib IN ITEMS avformat avcodec avutil swscale swresample)
++  string(TOUPPER "${_lib}" _lib_upper)
++  find_library(FFMPEG_${_lib_upper}_LIBRARY
++    NAMES ${_lib}
++    HINTS ${_ffmpeg_hints}
++    PATH_SUFFIXES lib)
++endforeach()
++
++find_package_handle_standard_args(FFMPEG
++  REQUIRED_VARS FFMPEG_INCLUDE_DIR
++                FFMPEG_AVFORMAT_LIBRARY
++                FFMPEG_AVCODEC_LIBRARY
++                FFMPEG_AVUTIL_LIBRARY
++                FFMPEG_SWSCALE_LIBRARY
++  FAIL_MESSAGE "FFmpeg SDK not found. Set FFMPEG_DIR to the SDK root (the directory that contains include/libavcodec/avcodec.h and lib/).")
++
++if(NOT FFMPEG_FOUND)
++  return()
++endif()
++
++# ABI floors, read from the SDK's own version headers.
++function(_ninfer_ffmpeg_require_major header macro name floor)
++  if(NOT EXISTS "${header}")
++    return()
++  endif()
++  file(STRINGS "${header}" _match REGEX "^#define ${macro} +[0-9]+")
++  if(_match MATCHES "${macro} +([0-9]+)")
++    if(CMAKE_MATCH_1 LESS floor)
++      message(FATAL_ERROR
++        "FFmpeg ${name} major ${CMAKE_MATCH_1} is older than the required ${floor} "
++        "(from ${header}); src/media/decode/decode.cpp targets the newer ABI.")
++    endif()
++  endif()
++endfunction()
++
++_ninfer_ffmpeg_require_major("${FFMPEG_INCLUDE_DIR}/libavformat/version_major.h"
++                             "LIBAVFORMAT_VERSION_MAJOR" "libavformat" 60)
++_ninfer_ffmpeg_require_major("${FFMPEG_INCLUDE_DIR}/libavcodec/version_major.h"
++                             "LIBAVCODEC_VERSION_MAJOR" "libavcodec" 60)
++_ninfer_ffmpeg_require_major("${FFMPEG_INCLUDE_DIR}/libavutil/version.h"
++                             "LIBAVUTIL_VERSION_MAJOR" "libavutil" 58)
++_ninfer_ffmpeg_require_major("${FFMPEG_INCLUDE_DIR}/libswscale/version_major.h"
++                             "LIBSWSCALE_VERSION_MAJOR" "libswscale" 7)
++
++set(FFMPEG_INCLUDE_DIRS "${FFMPEG_INCLUDE_DIR}")
++set(FFMPEG_LIBRARIES
++  "${FFMPEG_AVFORMAT_LIBRARY}"
++  "${FFMPEG_AVCODEC_LIBRARY}"
++  "${FFMPEG_SWSCALE_LIBRARY}")
++if(FFMPEG_SWRESAMPLE_LIBRARY)
++  list(APPEND FFMPEG_LIBRARIES "${FFMPEG_SWRESAMPLE_LIBRARY}")
++endif()
++list(APPEND FFMPEG_LIBRARIES "${FFMPEG_AVUTIL_LIBRARY}")
++
++set(FFMPEG_LIBRARY_DIRS "")
++foreach(_library IN LISTS FFMPEG_LIBRARIES)
++  get_filename_component(_dir "${_library}" DIRECTORY)
++  list(APPEND FFMPEG_LIBRARY_DIRS "${_dir}")
++endforeach()
++if(FFMPEG_LIBRARY_DIRS)
++  list(REMOVE_DUPLICATES FFMPEG_LIBRARY_DIRS)
++endif()
++
++# The project stages FFMPEG_VCPKG_TREE/bin/*.dll next to each executable; this SDK
++# keeps its runtime DLLs in exactly that place relative to the import libraries.
++get_filename_component(_ffmpeg_lib_dir "${FFMPEG_AVCODEC_LIBRARY}" DIRECTORY)
++get_filename_component(_ffmpeg_sdk_root "${_ffmpeg_lib_dir}" DIRECTORY)
++if(EXISTS "${_ffmpeg_sdk_root}/bin")
++  set(FFMPEG_VCPKG_TREE "${_ffmpeg_sdk_root}")
++endif()
++
++mark_as_advanced(FFMPEG_INCLUDE_DIR FFMPEG_AVFORMAT_LIBRARY FFMPEG_AVCODEC_LIBRARY
++                 FFMPEG_AVUTIL_LIBRARY FFMPEG_SWSCALE_LIBRARY FFMPEG_SWRESAMPLE_LIBRARY)
+diff --git a/src/media/CMakeLists.txt b/src/media/CMakeLists.txt
+index bc68b10..dddae9e 100644
+--- a/src/media/CMakeLists.txt
++++ b/src/media/CMakeLists.txt
+@@ -18,11 +18,16 @@ add_library(ninfer_media_decode STATIC
+ ninfer_internal_includes(ninfer_media_decode)
+ target_link_libraries(ninfer_media_decode PRIVATE ${NINFER_FFMPEG_TARGET})
+ if(NINFER_MEDIA_NATIVE_PNG)
++  # The zlib include directory is needed in BOTH branches: png_decode.cpp includes
++  # <zlib.h> and FFmpegVCPKG_TREE only supplies the import library. The vcpkg branch
++  # used to link the library without resolving ZLIB at all, so the header was never
++  # on the include path and the build failed with
++  #   png_decode.cpp(4): fatal error C1083: cannot open include file: 'zlib.h'
++  # whenever a vcpkg tree was present.
++  find_package(ZLIB REQUIRED)
+   if(DEFINED FFMPEG_VCPKG_TREE)
+     target_link_libraries(ninfer_media_decode PRIVATE "${FFMPEG_VCPKG_TREE}/lib/z.lib")
+-  else()
+-    find_package(ZLIB REQUIRED)
+-    target_link_libraries(ninfer_media_decode PRIVATE ZLIB::ZLIB)
+   endif()
++  target_link_libraries(ninfer_media_decode PRIVATE ZLIB::ZLIB)
+   target_compile_definitions(ninfer_media_decode PUBLIC NINFER_MEDIA_NATIVE_PNG)
+ endif()
+diff --git a/src/runtime/CMakeLists.txt b/src/runtime/CMakeLists.txt
+index 23e1090..9b220ae 100644
+--- a/src/runtime/CMakeLists.txt
++++ b/src/runtime/CMakeLists.txt
+@@ -1,23 +1,38 @@
+ # The measured device route profiles ship inside the binary: device_profiles.json (ninfer-calibrate
+ # --print output of each part, merged) becomes a string in the generated source.
++#
++# Generated by a script rather than configure_file(): the whole 30 KB payload in one
++# raw string literal exceeds the MSVC per-literal budget and fails with
++# "error C2026: string too big". The script emits the same value as adjacent
++# literals cut at newline boundaries. See tools/generate_device_profiles_builtin.py.
+ set(NINFER_DEVICE_PROFILES_FILE ${CMAKE_CURRENT_SOURCE_DIR}/engine/device_profiles.json)
++set(NINFER_DEVICE_PROFILES_OUT ${CMAKE_CURRENT_BINARY_DIR}/engine/device_profiles_builtin.cpp)
+ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${NINFER_DEVICE_PROFILES_FILE})
+-file(READ ${NINFER_DEVICE_PROFILES_FILE} NINFER_DEVICE_PROFILES_JSON)
+-configure_file(engine/device_profiles_builtin.cpp.in
+-               ${CMAKE_CURRENT_BINARY_DIR}/engine/device_profiles_builtin.cpp @ONLY)
++find_package(Python3 COMPONENTS Interpreter REQUIRED)
++add_custom_command(
++  OUTPUT ${NINFER_DEVICE_PROFILES_OUT}
++  COMMAND ${Python3_EXECUTABLE}
++          ${PROJECT_SOURCE_DIR}/tools/generate_device_profiles_builtin.py
++          --json ${NINFER_DEVICE_PROFILES_FILE}
++          --out ${NINFER_DEVICE_PROFILES_OUT}
++  DEPENDS ${NINFER_DEVICE_PROFILES_FILE}
++          ${PROJECT_SOURCE_DIR}/tools/generate_device_profiles_builtin.py
++  COMMENT "Generating device_profiles_builtin.cpp")
++add_custom_target(ninfer_device_profiles_builtin DEPENDS ${NINFER_DEVICE_PROFILES_OUT})
+ 
+ add_library(ninfer_runtime_support STATIC
+   engine/admission_policy.cpp
+   engine/context_cache/context_cost.cpp
+   engine/context_cache/context_cost_defaults.cpp
+   engine/device_profile.cpp
+-  ${CMAKE_CURRENT_BINARY_DIR}/engine/device_profiles_builtin.cpp
++  ${NINFER_DEVICE_PROFILES_OUT}
+   engine/kv_capacity.cpp
+   engine/public_types.cpp
+   prefix_cache/block_hash.cpp
+   prefix_cache/prefix_index.cpp
+   prefix_cache/tap_planner.cpp
+ )
++add_dependencies(ninfer_runtime_support ninfer_device_profiles_builtin)
+ ninfer_internal_includes(ninfer_runtime_support)
+ target_link_libraries(ninfer_runtime_support PUBLIC ninfer_core ninfer_ops PRIVATE ninfer::json)
+ 
+diff --git a/src/ops/linear/bf16/bf16_template_launch.cuh b/src/ops/linear/bf16/bf16_template_launch.cuh
+index 3c063e2..084a4b7 100644
+--- a/src/ops/linear/bf16/bf16_template_launch.cuh
++++ b/src/ops/linear/bf16/bf16_template_launch.cuh
+@@ -105,12 +105,17 @@ void launch_bf16_a16_sliced_k_mma(const Bf16A16Operands& p, Output output, Epilo
+     validate_bf16_operands<Schedule>(p);
+     if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK)
+         throw std::invalid_argument("BF16 sliced-K requires complete row/K tiles");
+-    constexpr auto kernel = bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue>;
+-    const int bytes       = bf16_prepare_shared<Schedule::kSharedBytes, kernel>();
+-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
++    // MSVC (CUDA 13.4 host compiler) rejects a __global__ function pointer that a
++    // generic lambda reaches through an implicit `[&]` capture: C2326 "function
++    // cannot access 'entry_kernel'". Capturing the entry point by value names it
++    // explicitly, which the compiler accepts; CUDA 12.8 accepted either spelling.
++    constexpr auto entry_kernel = bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue>;
++    const int bytes       = bf16_prepare_shared<Schedule::kSharedBytes, entry_kernel>();
++    for_each_token_slice(p.tokens, Schedule::kBlockTokens,
++                         [&, entry_kernel](int offset, int count) {
+         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
+-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.weight, output, epilogue, p.rows,
+-                                                            p.k, p.tokens, offset);
++        entry_kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.weight, output, epilogue,
++                                                                  p.rows, p.k, p.tokens, offset);
+         CUDA_CHECK(cudaGetLastError());
+     });
+ }
+diff --git a/src/ops/linear/fp8/fp8_template_launch.cuh b/src/ops/linear/fp8/fp8_template_launch.cuh
+index a016f71..6ea5649 100644
+--- a/src/ops/linear/fp8/fp8_template_launch.cuh
++++ b/src/ops/linear/fp8/fp8_template_launch.cuh
+@@ -76,11 +76,14 @@ void launch_fp8_a16_sliced_k_mma(const Fp8A16Operands& p, Output output, Epilogu
+         (Schedule::kExactTokens && p.tokens != capacity))
+         throw std::invalid_argument(
+             "FP8 sliced-K requires complete row/K tiles and matching tokens");
+-    constexpr auto kernel = fp8_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
+-    const int bytes       = fp8_prepare_shared<Schedule::kSharedBytes, kernel>();
+-    for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
++    // MSVC (CUDA 13.4 host compiler) rejects a __global__ function pointer reached
++    // through an implicit `[&]` capture (C2326), so the entry point is captured by
++    // value explicitly. CUDA 12.8 accepted either spelling.
++    constexpr auto entry_kernel = fp8_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
++    const int bytes       = fp8_prepare_shared<Schedule::kSharedBytes, entry_kernel>();
++    for_each_token_slice(p.tokens, capacity, [&, entry_kernel](int offset, int count) {
+         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
+-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset);
++        entry_kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset);
+         CUDA_CHECK(cudaGetLastError());
+     });
+ }
+diff --git a/src/ops/linear/nvfp4/nvfp4_template_launch.cuh b/src/ops/linear/nvfp4/nvfp4_template_launch.cuh
+index 341005b..973ee0d 100644
+--- a/src/ops/linear/nvfp4/nvfp4_template_launch.cuh
++++ b/src/ops/linear/nvfp4/nvfp4_template_launch.cuh
+@@ -82,11 +82,14 @@ void launch_nvfp4_a16_sliced_k_mma(const Nvfp4A16Operands& p, Output output, Epi
+         (Schedule::kExactTokens && p.tokens != capacity))
+         throw std::invalid_argument(
+             "NVFP4 sliced-K requires complete row/K tiles and matching tokens");
+-    constexpr auto kernel = nvfp4_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
+-    const int bytes       = nvfp4_prepare_shared<Schedule::kSharedBytes, kernel>();
+-    for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
++    // MSVC (CUDA 13.4 host compiler) rejects a __global__ function pointer reached
++    // through an implicit `[&]` capture (C2326), so the entry point is captured by
++    // value explicitly. CUDA 12.8 accepted either spelling.
++    constexpr auto entry_kernel = nvfp4_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
++    const int bytes       = nvfp4_prepare_shared<Schedule::kSharedBytes, entry_kernel>();
++    for_each_token_slice(p.tokens, capacity, [&, entry_kernel](int offset, int count) {
+         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
+-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset);
++        entry_kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset);
+         CUDA_CHECK(cudaGetLastError());
+     });
+ }
+diff --git a/tools/generate_device_profiles_builtin.py b/tools/generate_device_profiles_builtin.py
+new file mode 100644
+index 0000000..95504bc
+--- /dev/null
++++ b/tools/generate_device_profiles_builtin.py
+@@ -0,0 +1,95 @@
++"""Emit the embedded device-route-profile JSON as several C++ string literals.
++
++WHY: `src/runtime/engine/device_profiles_builtin.cpp.in` splices
++`device_profiles.json` (30,566 bytes) into a single raw string literal. MSVC
++rejects such a literal with
++
++    device_profiles_builtin.cpp(217): error C2026: string too big, trailing
++    characters truncated
++
++because its per-literal budget is far below the JSON size. The reference build
++used CUDA 12.8, whose supported MSVC releases accepted the single literal; the
++toolchain available here is MSVC 19.44 with CUDA 13.4, which does not.
++
++This script performs the same substitution but splits the payload into adjacent
++string literals of at most CHUNK bytes, cut at newline boundaries so the
++generated C++ stays valid without escaping. Adjacent literals concatenate at
++translation time, so the value returned is byte-identical to the input file.
++
++Output path and result are interchangeable with the CMake-generated file, so
++nothing else in the build changes.
++"""
++from __future__ import annotations
++
++import argparse
++import pathlib
++import sys
++
++# Keep well below the compiler's per-literal budget, which is documented in the
++# low tens of thousands of bytes but has shifted between MSVC releases. Cutting
++# at or under this bound is safe for every release in the supported range.
++CHUNK = 12000
++
++HEADER = '''#include "runtime/engine/device_profiles_builtin.h"
++
++namespace ninfer::runtime {
++
++// Generated from src/runtime/engine/device_profiles.json.
++// Split into adjacent string literals by tools/generate_device_profiles_builtin.py
++// because the whole 30 KB payload in one literal exceeds the MSVC per-literal
++// budget (C2026). Adjacent literals concatenate, so the returned view is
++// byte-identical to the JSON source.
++std::string_view compiled_device_route_profiles_json() {
++    return
++'''
++
++FOOTER = ''';
++}
++
++} // namespace ninfer::runtime
++'''
++
++
++def split_payload(text: str, limit: int) -> list[str]:
++    """Cut `text` into pieces of at most `limit` characters, preferring newlines."""
++    pieces: list[str] = []
++    start = 0
++    length = len(text)
++    while start < length:
++        end = min(start + limit, length)
++        if end < length:
++            newline = text.rfind("\n", start, end)
++            if newline != -1 and newline + 1 > start:
++                end = newline + 1
++        pieces.append(text[start:end])
++        start = end
++    return pieces
++
++
++def render_chunk(piece: str) -> str:
++    """One C++ raw string literal holding `piece`, including its newlines."""
++    if "(/" in piece or ")/" in piece:
++        # Raw-string delimiters must not appear inside the payload.
++        raise SystemExit("payload contains a raw-string delimiter sequence")
++    return f'        R"ninfer_json({piece})ninfer_json"\n'
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--json", type=pathlib.Path, required=True)
++    parser.add_argument("--out", type=pathlib.Path, required=True)
++    args = parser.parse_args()
++
++    text = args.json.read_text(encoding="utf-8")
++    pieces = split_payload(text, CHUNK)
++
++    body = "".join(render_chunk(piece) for piece in pieces)
++    args.out.parent.mkdir(parents=True, exist_ok=True)
++    args.out.write_text(HEADER + body + FOOTER, encoding="utf-8")
++
++    print(f"wrote {args.out} ({len(pieces)} literals, {len(text)} bytes of JSON)")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/models/qwen3_5/test_host_backed_prefix_fork.cpp b/tests/models/qwen3_5/test_host_backed_prefix_fork.cpp
+new file mode 100644
+index 0000000..9df8c45
+--- /dev/null
++++ b/tests/models/qwen3_5/test_host_backed_prefix_fork.cpp
+@@ -0,0 +1,445 @@
++#include "core/device.h"
++#include "models/qwen3_5/program/storage/host_kv_store.h"
++#include <array>
++#include <cstring>
++#include <iostream>
++#include <stdexcept>
++#include <vector>
++
++namespace {
++namespace kv = ninfer::models::qwen3_5::detail;
++void check(bool value, const char* message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++struct Fixture {
++    ninfer::DeviceContext device{0};
++    ninfer::LayoutBuilder builder;
++    ninfer::DeviceKVPagePoolLayout page_layout = ninfer::plan_device_kv_page_pool(
++        builder, {.page_group_count = 8, .allow_logical_reservation = true,
++                  .geometry = {.page_tokens = 64,
++                    .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
++                    .planes = {{.dtype = ninfer::DType::BF16,
++                                .leading_extent = 8, .head_extent = 2}}}});
++    ninfer::KVExecutionTableLayout table_layout = ninfer::plan_kv_execution_tables(
++        builder, {.logical_page_capacity = 16, .table_rows = 2});
++    ninfer::DeviceArena arena{builder.finish(256)};
++    ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
++    ninfer::DeviceKVPagePool physical{backing, page_layout};
++    ninfer::KVExecutionTablePool tables{backing, table_layout, physical};
++    ninfer::HostKVPageLayout host_layout = ninfer::plan_host_kv_page_layout(physical.geometry());
++    std::array<ninfer::HostKVPageLayout, 1> layouts{host_layout};
++    ninfer::HostKVArena host{host_layout.page_stride * 32, layouts};
++    kv::LogicalKVPageStore pages{physical, 48};
++    kv::HostKVExtentStore extents{host, 32};
++    kv::KVAddressSpaceStore addresses{pages, tables, 6, 16};
++
++    void backup(kv::LogicalKVPageHandle page) {
++        const std::array membership{page};
++        auto reservation = extents.prepare(pages, membership);
++        check(reservation.has_value(), "Host backup reservation");
++        physical.copy_to_host(extents.device_sources(*reservation),
++                              extents.writable_view(*reservation), device.transfer_stream);
++        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
++        check(extents.publish(std::move(*reservation)).has_value(), "Host backup publication");
++    }
++    kv::KVAddressSpaceHandle source(std::uint32_t frontier) {
++        auto address = addresses.create_active(16, 0, {});
++        check(address.has_value(), "source allocation");
++        const std::uint32_t count = (frontier + 63) / 64;
++        for (std::uint32_t i = 0; i < count; ++i) {
++            if (i != 0) {
++                auto activation = addresses.prepare_activation(*address, 16, 0, {}, true);
++                addresses.commit_activation(std::move(activation), device.stream);
++            }
++            const auto end = std::min(frontier, (i + 1) * 64);
++            addresses.ensure_mapped_to_tokens(*address, end, device.stream);
++            auto logical = addresses.logical_page(*address, i);
++            auto payload = host.allocate(host_layout, 1);
++            check(payload.has_value(), "test payload allocation");
++            auto writable = host.writable_view(*payload);
++            std::memset(writable.data(), static_cast<int>(i + 1), host_layout.page_stride);
++            const std::array target{pages.physical(logical)};
++            physical.copy_from_host(writable, target, device.stream);
++            device.synchronize();
++            addresses.commit_frontier(*address, end);
++            addresses.deactivate(*address);
++            backup(logical);
++            // Keep a small resident suffix, as the production Host-backed ring does.
++            if (i >= 3) {
++                check(pages.drop_device_replica(addresses.logical_page(*address, i - 3)),
++                      "source ring demotion");
++            }
++        }
++        addresses.set_checkpoint_requirement(*address, frontier);
++        return *address;
++    }
++    auto fork(kv::KVAddressSpaceHandle source, kv::KVAddressSpaceHandle destination,
++              std::uint32_t frontier, std::uint32_t entitlement = 16, bool staged = false) {
++#ifdef HOST_AWARE_PREFIX_FORK
++        return addresses.prepare_prefix_fork(source, destination, frontier, entitlement, 1,
++                                             staged, true);
++#else
++        return addresses.prepare_prefix_fork(source, destination, frontier, entitlement, 1, staged);
++#endif
++    }
++    std::vector<std::byte> bytes(kv::LogicalKVPageHandle page) {
++        auto payload = host.allocate(host_layout, 1);
++        check(payload.has_value(), "test readback allocation");
++        auto view = host.writable_view(*payload);
++        const std::array source{pages.physical(page)};
++        physical.copy_to_host(source, view, device.stream);
++        device.synchronize();
++        return {view.data(), view.data() + host_layout.page_stride};
++    }
++    void cleanup(kv::KVAddressSpaceHandle source, kv::KVAddressSpaceHandle destination) {
++        check(addresses.release_after_deactivate(destination), "child release");
++        check(addresses.release(source), "parent release");
++        (void)extents.release_unreferenced();
++        check(pages.occupied() == 0 && physical.allocated_pages() == 0 &&
++                  physical.reserved_pages() == 0, "all logical/physical/reservation resources freed");
++    }
++};
++
++void full_page_fork() {
++    Fixture f;
++    const auto source = f.source(12 * 64);
++    const auto child = *f.addresses.create_inactive();
++    const auto row = f.tables.matrix().slice(1, 1, 1).view({16});
++    // DeviceContext uses non-blocking streams: default-stream cudaMemset is not ordered
++    // before commit's table copies. Initialize the sentinel on that same compute stream.
++    CUDA_CHECK(cudaMemsetAsync(row.data, 0xff, 16 * sizeof(std::int32_t), f.device.stream));
++    auto fork = f.fork(source, child, 12 * 64);
++    check(!f.addresses.can_release(source), "transaction pins protect the parent lifecycle");
++    for (unsigned i = 0; i < 12; ++i) {
++        check(f.pages.source_pins(f.addresses.logical_page(source, i)) == 1, "fork pins all sources");
++    }
++    f.addresses.commit_prefix_fork(std::move(fork), f.device.stream);
++    f.device.synchronize();
++    check(f.addresses.committed_frontier(child) == 768 && f.addresses.active(child),
++          "Host-backed child publishes exact frontier");
++    check(f.physical.allocated_pages() == 3 && f.physical.reserved_pages() == 13,
++          "Host sharing allocates no Device pages and reserves missing plus growth");
++    std::array<std::int32_t, 16> entries;
++    CUDA_CHECK(cudaMemcpy(entries.data(), row.data, sizeof(entries), cudaMemcpyDeviceToHost));
++    for (unsigned i = 0; i < 12; ++i) {
++        auto page = f.addresses.logical_page(source, i);
++        check(page == f.addresses.logical_page(child, i) && f.pages.address_references(page) == 2 &&
++                  f.pages.source_pins(page) == 0 && f.pages.writer_references(page) == 0,
++              "full pages share immutable logical identities");
++        check(f.pages.active_address_references(page) == (f.pages.device_resident(page) ? 1U : 0U),
++              "only resident pages hold active references");
++        check(f.pages.device_resident(page) ? entries[i] >= 0 && entries[i] < 8 : entries[i] == -1,
++              "execution row publishes only resident runs");
++    }
++    // A retained parent cannot disappear when the child is activated.
++    check(f.addresses.can_release(source), "retained parent remains independently releasable");
++    f.cleanup(source, child);
++}
++
++void partial_tail_fork() {
++    Fixture f;
++    const auto source = f.source(12 * 64 + 7);
++    const auto child = *f.addresses.create_inactive();
++    const auto tail = f.addresses.logical_page(source, 12);
++    const auto before = f.bytes(tail);
++    const auto epoch = f.pages.content_epoch(tail);
++    auto fork = f.fork(source, child, 775);
++    f.physical.copy_page(f.addresses.prefix_fork_tail_source(fork),
++                        f.addresses.prefix_fork_tail_destination(fork), f.device.transfer_stream);
++    CUDA_CHECK(cudaStreamSynchronize(f.device.transfer_stream));
++    f.addresses.commit_prefix_fork(std::move(fork), f.device.stream);
++    const auto child_tail = f.addresses.logical_page(child, 12);
++    check(child_tail != tail && f.bytes(child_tail) == before, "partial tail is a true payload COW");
++    f.addresses.ensure_mapped_to_tokens(child, 776, f.device.stream);
++    auto appended = f.host.allocate(f.host_layout, 1);
++    check(appended.has_value(), "append test payload allocation");
++    auto writable = f.host.writable_view(*appended);
++    std::memcpy(writable.data(), before.data(), before.size());
++    // Host layout for this single BF16 plane is [8,64,2]; change token column 7.
++    writable.data()[7 * 8 * sizeof(std::uint16_t)] = std::byte{0x55};
++    const std::array target{f.pages.physical(child_tail)};
++    f.physical.copy_from_host(writable, target, f.device.stream);
++    f.device.synchronize();
++    f.addresses.commit_frontier(child, 776);
++    check(f.pages.committed_columns(child_tail) == 8 && f.pages.writer_references(child_tail) == 1,
++          "private child tail appends");
++    check(f.pages.committed_columns(tail) == 7 && f.pages.content_epoch(tail) == epoch &&
++              f.bytes(tail) == before && f.bytes(child_tail) != before &&
++              f.addresses.committed_frontier(source) == 775,
++          "parent payload, epoch and frontier survive child append");
++    f.cleanup(source, child);
++}
++
++void abort_fork() {
++    Fixture f;
++    const auto source = f.source(775);
++    const auto child = *f.addresses.create_inactive();
++    const auto allocated = f.physical.allocated_pages();
++    {
++        auto fork = f.fork(source, child, 775);
++        check(f.physical.allocated_pages() == allocated + 1, "abort fixture has private COW page");
++        f.addresses.abort_prefix_fork(fork);
++        check(f.physical.allocated_pages() == allocated && f.physical.reserved_pages() == 0,
++              "explicit abort immediately releases pages and reservations");
++        auto row = f.tables.acquire(1);
++        check(row.valid(), "explicit abort immediately releases execution row");
++    }
++    check(f.physical.allocated_pages() == allocated && f.physical.reserved_pages() == 0,
++          "abort frees COW and reservations");
++    for (unsigned i = 0; i < 13; ++i) {
++        auto page = f.addresses.logical_page(source, i);
++        check(f.pages.source_pins(page) == 0 && f.pages.address_references(page) == 1,
++              "abort restores source pins and references");
++    }
++    check(!f.addresses.active(child) && f.addresses.mapped_pages(child) == 0,
++          "abort leaves child unpublished");
++    f.cleanup(source, child);
++}
++
++void staged_tail_fork() {
++    Fixture f;
++    const auto source = f.source(775);
++    const auto child = *f.addresses.create_inactive();
++    const auto tail = f.addresses.logical_page(source, 12);
++    const auto before = f.bytes(tail);
++    auto fork = f.fork(source, child, 775, 16, true);
++    f.physical.copy_page(f.addresses.prefix_fork_tail_source(fork),
++                        f.addresses.prefix_fork_tail_destination(fork), f.device.transfer_stream);
++    CUDA_CHECK(cudaStreamSynchronize(f.device.transfer_stream));
++    f.addresses.settle_prefix_fork_tail_source(fork);
++    check(f.pages.drop_device_replica(tail), "staged source tail demotes after copy");
++    f.addresses.complete_prefix_fork_after_tail_release(fork);
++    f.addresses.commit_prefix_fork(std::move(fork), f.device.stream);
++    check(f.bytes(f.addresses.logical_page(child, 12)) == before &&
++              !f.pages.device_resident(tail) && f.pages.host_replica_current(tail),
++          "staged fork preserves Host parent and independent Device child tail");
++    check(f.physical.reserved_pages() == 13, "staged settlement retains missing plus growth budget");
++    f.cleanup(source, child);
++}
++
++void stale_host_rejected() {
++    Fixture f;
++    const auto source = f.source(768);
++    const auto child = *f.addresses.create_inactive();
++    const auto first = f.addresses.logical_page(source, 0);
++    // Fault injection into a published replica tests validation independently of the Host
++    // publisher, which correctly refuses to create stale metadata through its public API.
++    auto& replica = const_cast<kv::HostKVPageReplica&>(f.pages.host_replica(first));
++    const auto epoch = replica.content_epoch;
++    const auto columns = replica.committed_columns;
++    auto rejected_without_mutation = [&] {
++        bool rejected = false;
++        try { auto fork = f.fork(source, child, 768); }
++        catch (const ninfer::ContextCacheExhausted&) {
++            throw std::runtime_error("stale Host epoch/coverage must not be classified as capacity");
++        }
++        catch (const std::logic_error&) { rejected = true; }
++        check(rejected && f.physical.reserved_pages() == 0 &&
++                  f.pages.source_pins(first) == 0 && f.addresses.mapped_pages(child) == 0,
++              "invalid Host replica rejected without mutation");
++    };
++    replica.content_epoch = epoch + 1;
++    rejected_without_mutation();
++    replica.content_epoch = epoch;
++    replica.committed_columns = columns - 1;
++    rejected_without_mutation();
++    replica.committed_columns = columns;
++    {
++        auto fork = f.fork(source, child, 768);
++        replica.content_epoch = epoch + 1;
++        bool rejected = false;
++        try { f.addresses.commit_prefix_fork(std::move(fork), f.device.stream); }
++        catch (const std::logic_error&) { rejected = true; }
++        check(rejected && !f.addresses.active(child), "commit revalidates Host epoch");
++        replica.content_epoch = epoch;
++    }
++    check(f.pages.source_pins(first) == 0 && f.physical.reserved_pages() == 0,
++          "failed commit RAII abort restores pins and reservations");
++    f.cleanup(source, child);
++}
++
++void insufficient_logical_coverage_rejected() {
++    Fixture f;
++    const auto source = f.source(64);
++    const auto child = *f.addresses.create_inactive();
++    const auto page = f.addresses.logical_page(source, 0);
++    f.addresses.set_checkpoint_requirement(source, 0);
++    const std::array membership{page};
++    check(f.extents.release_page_replicas(f.pages, membership), "remove Host backup for fault injection");
++    // Deliberately leave the owner's frontier inconsistent with its logical page coverage.
++    // The fork must surface that invariant violation, rather than turn it into HTTP 429.
++    f.pages.set_writer(page, true);
++    f.pages.destructive_truncate(page, 3);
++    f.pages.set_writer(page, false);
++    bool rejected = false;
++    try { auto fork = f.fork(source, child, 64); }
++    catch (const ninfer::ContextCacheExhausted&) {
++        throw std::runtime_error("insufficient logical coverage must not be classified as capacity");
++    }
++    catch (const std::logic_error&) { rejected = true; }
++    check(rejected && f.pages.source_pins(page) == 0 && f.physical.reserved_pages() == 0 &&
++              !f.addresses.active(child), "coverage invariant rejects before mutation");
++    f.cleanup(source, child);
++}
++
++void physical_exhaustion_rejected() {
++    Fixture f;
++    const auto source = f.source(775);
++    const auto child = *f.addresses.create_inactive();
++    const auto filler = *f.addresses.create_active(5, 0, {});
++    f.addresses.ensure_mapped_to_tokens(filler, 5 * 64, f.device.stream);
++    check(f.physical.allocated_pages() == 8, "fixture fills physical pool");
++    bool rejected = false;
++    try { auto fork = f.fork(source, child, 775); }
++    catch (const ninfer::ContextCacheExhausted&) { rejected = true; }
++    check(rejected && !f.addresses.active(child) && f.physical.allocated_pages() == 8 &&
++              f.physical.reserved_pages() == 0,
++          "Host-aware fork cannot fake success without a physical COW destination");
++    check(f.addresses.release_after_deactivate(filler), "filler releases");
++    f.cleanup(source, child);
++}
++
++void default_resident_only() {
++    Fixture f;
++    const auto source = f.source(128);
++    const auto child = *f.addresses.create_inactive();
++    auto fork = f.addresses.prepare_prefix_fork(source, child, 128, 3, 1);
++    f.addresses.commit_prefix_fork(std::move(fork), f.device.stream);
++    check(f.addresses.entitlement(child) == 3 && f.physical.reserved_pages() == 1,
++          "default resident-only fork preserves entitlement");
++    f.cleanup(source, child);
++
++    const auto host_source = f.source(768);
++    const auto host_child = *f.addresses.create_inactive();
++    bool rejected = false;
++    try { auto unchanged = f.addresses.prepare_prefix_fork(host_source, host_child, 768, 16, 1); }
++    catch (const ninfer::ContextCacheExhausted&) { rejected = true; }
++    check(rejected, "default resident-only API still rejects Host-only pages");
++    f.cleanup(host_source, host_child);
++}
++
++void aliased_full_page_partial_tail() {
++    Fixture f;
++    const auto source = f.source(64);
++    const auto alias = *f.addresses.create_inactive();
++    auto alias_fork = f.addresses.prepare_prefix_fork(source, alias, 64, 1, 1);
++    f.addresses.commit_prefix_fork(std::move(alias_fork), f.device.stream);
++    f.device.synchronize();
++    f.addresses.deactivate(alias);
++    f.addresses.set_checkpoint_requirement(alias, 64);
++    const auto shared = f.addresses.logical_page(source, 0);
++    const auto other_alias = f.addresses.logical_page(alias, 0);
++    check(shared == other_alias && f.pages.address_references(shared) == 2 &&
++              f.pages.committed_columns(shared) == 64 && f.pages.host_replica_current(shared),
++          "two inactive owners share a complete Host-backed logical page");
++    const auto before = f.bytes(shared);
++    const auto epoch = f.pages.content_epoch(shared);
++    const auto child = *f.addresses.create_inactive();
++    auto fork = f.fork(source, child, 3, 1);
++    check(f.pages.source_pins(shared) == 1 && f.pages.source_pins(other_alias) == 1 &&
++              !f.pages.drop_device_replica(other_alias) && !f.pages.drop_device_replica(shared),
++          "partial-tail source pin protects every alias of the same logical page");
++    check(!f.addresses.can_release(source) && !f.addresses.can_release(alias),
++          "the pin protects both parent owner lifetimes");
++    f.physical.copy_page(f.addresses.prefix_fork_tail_source(fork),
++                        f.addresses.prefix_fork_tail_destination(fork), f.device.transfer_stream);
++    CUDA_CHECK(cudaStreamSynchronize(f.device.transfer_stream));
++    f.addresses.commit_prefix_fork(std::move(fork), f.device.stream);
++    const auto child_tail = f.addresses.logical_page(child, 0);
++    check(child_tail != shared && f.pages.committed_columns(child_tail) == 3 &&
++              f.pages.source_pins(shared) == 0 && f.pages.can_drop_device_replica(shared),
++          "COW creates a private three-column tail and releases the shared pin");
++    auto appended = f.host.allocate(f.host_layout, 1);
++    check(appended.has_value(), "alias append payload allocation");
++    auto writable = f.host.writable_view(*appended);
++    std::memcpy(writable.data(), before.data(), before.size());
++    writable.data()[3 * 8 * sizeof(std::uint16_t)] = std::byte{0x66};
++    const std::array target{f.pages.physical(child_tail)};
++    f.physical.copy_from_host(writable, target, f.device.stream);
++    f.device.synchronize();
++    f.addresses.commit_frontier(child, 4);
++    check(f.bytes(child_tail) != before && f.bytes(shared) == before &&
++              f.bytes(other_alias) == before && f.pages.committed_columns(shared) == 64 &&
++              f.pages.committed_columns(other_alias) == 64 &&
++              f.pages.content_epoch(shared) == epoch && f.pages.content_epoch(other_alias) == epoch &&
++              f.addresses.committed_frontier(source) == 64 &&
++              f.addresses.committed_frontier(alias) == 64,
++          "child rewrite leaves both inactive parents' payload, coverage and epoch intact");
++    check(f.addresses.release(alias), "second inactive parent releases independently");
++    f.cleanup(source, child);
++}
++
++void dual_pool_consumed_suffix_lifetime() {
++    for (const bool staged : {false, true}) {
++        Fixture main;
++        Fixture backend;
++        const auto main_source = main.source(900);
++        const auto backend_source = backend.source(901);
++        // Mirror prepare_consumed_source: trim only discarded suffix membership, without
++        // changing the kept partial page's canonical coverage before its COW completes.
++        main.addresses.truncate_inactive_prefix(main_source, 775);
++        backend.addresses.truncate_inactive_prefix(backend_source, 776);
++        main.addresses.set_checkpoint_requirement(main_source, 775);
++        backend.addresses.set_checkpoint_requirement(backend_source, 776);
++        (void)main.extents.release_unreferenced();
++        (void)backend.extents.release_unreferenced();
++        const auto main_child = *main.addresses.create_inactive();
++        const auto backend_child = *backend.addresses.create_inactive();
++        auto main_fork = main.fork(main_source, main_child, 775, 16, staged);
++        auto backend_fork = backend.fork(backend_source, backend_child, 776, 16, staged);
++        const auto complete_copy = [&](Fixture& f, kv::KVAddressSpaceHandle source,
++                                       kv::KVPrefixForkReservation& fork) {
++            f.physical.copy_page(f.addresses.prefix_fork_tail_source(fork),
++                                 f.addresses.prefix_fork_tail_destination(fork),
++                                 f.device.transfer_stream);
++            CUDA_CHECK(cudaStreamSynchronize(f.device.transfer_stream));
++            if (staged) {
++                const auto tail = f.addresses.logical_page(source, 12);
++                f.addresses.settle_prefix_fork_tail_source(fork);
++                check(f.pages.drop_device_replica(tail), "dual-pool staged tail demotion");
++                f.addresses.complete_prefix_fork_after_tail_release(fork);
++            }
++        };
++        complete_copy(main, main_source, main_fork);
++        complete_copy(backend, backend_source, backend_fork);
++        const auto backend_reserved = backend.physical.reserved_pages();
++        main.addresses.commit_prefix_fork(std::move(main_fork), main.device.stream);
++        check(main.addresses.release(main_source), "consumed main source releases after commit");
++        (void)main.extents.release_unreferenced();
++        check(backend.physical.reserved_pages() == backend_reserved &&
++                  !backend.addresses.can_release(backend_source),
++              "main commit/source release cannot alter backend reservations or source pins");
++        backend.addresses.commit_prefix_fork(std::move(backend_fork), backend.device.stream);
++        check(backend.addresses.release(backend_source), "consumed backend source releases after commit");
++        (void)backend.extents.release_unreferenced();
++        for (auto item : {std::pair{&main, main_child}, std::pair{&backend, backend_child}}) {
++            check(item.first->addresses.release_after_deactivate(item.second), "dual-pool child release");
++            (void)item.first->extents.release_unreferenced();
++            check(item.first->physical.allocated_pages() == 0 &&
++                      item.first->physical.reserved_pages() == 0 && item.first->pages.occupied() == 0,
++                  "dual-pool consumed lifecycle leaves no resources");
++        }
++    }
++}
++}
++
++int main() {
++    try {
++        full_page_fork();
++        partial_tail_fork();
++        abort_fork();
++        staged_tail_fork();
++        stale_host_rejected();
++        insufficient_logical_coverage_rejected();
++        physical_exhaustion_rejected();
++        default_resident_only();
++        aliased_full_page_partial_tail();
++        dual_pool_consumed_suffix_lifetime();
++        std::cout << "PASS: Host-backed prefix fork full/partial/abort/staged/stale/capacity/default/alias-tail/dual-pool\n";
++        return 0;
++    } catch (const std::exception& error) {
++        std::cerr << "FAIL: " << error.what() << '\n';
++        return 1;
++    }
++}
